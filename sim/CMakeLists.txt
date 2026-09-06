@@ -22,13 +22,21 @@ target_include_directories(lvgl PRIVATE ${SDL2_INCLUDE_DIRS})
 add_executable(vantage_sim
   main.c
   wm.c
+  host_wifi.c
+  sdk_bridge.c
+  apps/registry.c
   "${CMAKE_CURRENT_SOURCE_DIR}/../main/wm_anim.c"
 )
 
 target_include_directories(vantage_sim PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}"
   "${CMAKE_CURRENT_SOURCE_DIR}/../main"
+  "${CMAKE_CURRENT_SOURCE_DIR}/../app_sdk"
   ${SDL2_INCLUDE_DIRS}
 )
 
 target_link_libraries(vantage_sim PRIVATE lvgl ${SDL2_LIBRARIES})
+
+if(WIN32)
+  target_link_libraries(vantage_sim PRIVATE wlanapi)
+endif()

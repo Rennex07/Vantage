@@ -28,11 +28,32 @@ cmake --build build --config Debug --target vantage_sim
 The simulator deliberately keeps side effects separate from a real device:
 
 - Its virtual `/int` and `/sdcard` drives are folders below `sim_data/`.
-- Wi-Fi results and connection state are deterministic; it never changes the
-  computer's wireless connection. Credentials are stored only in
-  `sim_data/system/wifi.txt`.
+- On Windows, the Wi-Fi screen reads the host's current connection through the
+  WLAN API. It never scans, connects, disconnects, or stores credentials.
+  Other desktop targets report that host Wi-Fi status is unavailable.
 - The VPK flow exercises installation, registry, Home, and lifecycle UI. An
   ESP ELF is not executable on a desktop; an installed package opens a native
   desktop stand-in until the app is rebuilt for the simulator ABI.
 - OTA is represented visually and never writes firmware or changes a boot
   partition.
+
+### Portable apps: run the same app source in both targets
+
+`app_sdk/vantage_app.h` is the portable app boundary. It exposes the app
+descriptor lifecycle plus basic window, text, button, toast, and private-data
+path APIs without exposing ESP-IDF or SDL headers. The simulator registry is
+empty by default, so no sample or placeholder app appears on Home.
+
+To add a simulator-capable app:
+
+1. Write the app source using only `#include "vantage_app.h"`, and export a
+   unique descriptor function such as `vantage_notes_descriptor()`.
+2. Add the source to the `vantage_sim` executable in `sim/CMakeLists.txt`.
+3. Add its descriptor function to `sim/apps/registry.c`.
+4. Build the simulator. The app is discovered by Home automatically.
+
+The same source can be compiled into a VPK for the ESP target when its app
+build includes `app_sdk/` and `main/` as include directories. The VPK still
+contains an ESP ELF, while the simulator compiles the source natively for the
+desktop. This is why the UI and portable SDK behavior can be shared even
+though the produced binaries are different.

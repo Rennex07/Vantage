@@ -1,5 +1,7 @@
 #include "wm.h"
 #include "wm_anim.h"
+#include "sdk_bridge.h"
+#include "host_wifi.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,6 +21,10 @@
 #define SCREEN_H 480
 #define CONTENT_H 426
 #define PATH_LEN 512
+
+/*
+Look the other way if you don't want to sell your soul to the devil.
+*/
 
 typedef struct wm_event_ctx {
   wm_action_cb_t tap_cb;
@@ -73,12 +79,6 @@ typedef struct {
   lv_obj_t *modal;
 } package_install_ctx_t;
 
-typedef struct {
-  char ssid[33];
-  lv_obj_t *modal;
-  lv_obj_t *password;
-} wifi_ctx_t;
-
 static lv_obj_t *main_screen;
 static lv_obj_t *status_bar;
 static lv_obj_t *app_container;
@@ -89,7 +89,6 @@ static lv_obj_t *recents_modal;
 static window_node_t *window_list;
 static window_node_t *active_window;
 static lv_obj_t *launch_source;
-static bool wifi_connected;
 static char connected_ssid[33];
 
 static void home_create(lv_obj_t *parent);
@@ -356,7 +355,6 @@ void wm_keyboard_hide(void) {
 }
 
 void wm_update_wifi_status(bool connected) {
-  wifi_connected = connected;
   if (wifi_icon)
     lv_label_set_text(wifi_icon, connected ? LV_SYMBOL_WIFI : "");
 }
@@ -377,6 +375,7 @@ void wm_open_app(const app_descriptor_t *app, void *process) {
     if (active_window && active_window != existing)
       lv_obj_add_flag(active_window->root_view, LV_OBJ_FLAG_HIDDEN);
     active_window = existing;
+    sim_sdk_focus_app(existing->app);
     lv_obj_clear_flag(existing->root_view, LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(existing->root_view);
     return;
@@ -402,6 +401,9 @@ void wm_open_app(const app_descriptor_t *app, void *process) {
     node->prev = tail;
   }
   active_window = node;
+  if (app->payload)
+    lv_obj_set_user_data(node->root_view, app->payload);
+  sim_sdk_focus_app(app);
   if (app->on_create)
     app->on_create(node->root_view);
   lv_obj_clear_flag(node->root_view, LV_OBJ_FLAG_HIDDEN);
@@ -436,6 +438,7 @@ void wm_close_current(void) {
   free(closing);
   active_window = next;
   if (active_window) {
+    sim_sdk_focus_app(active_window->app);
     lv_obj_clear_flag(active_window->root_view, LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(active_window->root_view);
   }
@@ -449,6 +452,7 @@ void wm_minimize_current(void) {
   window_node_t *home = find_window(&home_app);
   if (home) {
     active_window = home;
+    sim_sdk_focus_app(home->app);
     lv_obj_clear_flag(home->root_view, LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(home->root_view);
   }
@@ -462,6 +466,7 @@ static void recents_pick(lv_obj_t *object, void *user_data) {
   for (window_node_t *node = window_list; node; node = node->next)
     lv_obj_add_flag(node->root_view, LV_OBJ_FLAG_HIDDEN);
   active_window = selected;
+  sim_sdk_focus_app(selected->app);
   lv_obj_clear_flag(selected->root_view, LV_OBJ_FLAG_HIDDEN);
   lv_obj_move_foreground(selected->root_view);
   if (recents_modal) {
@@ -503,6 +508,7 @@ void wm_show_home(void) {
     if (node != home)
       lv_obj_add_flag(node->root_view, LV_OBJ_FLAG_HIDDEN);
   active_window = home;
+  sim_sdk_focus_app(home->app);
   lv_obj_clear_flag(home->root_view, LV_OBJ_FLAG_HIDDEN);
   lv_obj_move_foreground(home->root_view);
 }
@@ -623,6 +629,14 @@ void wm_reload_home(void) {
     lv_obj_t *package = add_grid_item(home_grid, "VPK App", LV_SYMBOL_FILE);
     wm_on_tap(package, launch_app, (void *)&package_app);
   }
+  for (size_t index = 0; index < sim_portable_app_count(); ++index) {
+    const app_descriptor_t *portable =
+        sim_sdk_wrap_app(sim_portable_app_at(index));
+    if (!portable)
+      continue;
+    lv_obj_t *app = add_grid_item(home_grid, portable->title, LV_SYMBOL_FILE);
+    wm_on_tap(app, launch_app, (void *)portable);
+  }
 }
 
 static void home_create(lv_obj_t *parent) {
@@ -651,75 +665,50 @@ static void close_modal(lv_obj_t *object, void *user_data) {
     lv_obj_del(modal);
 }
 
-static void wifi_connect(lv_obj_t *object, void *user_data) {
-  (void)object;
-  wifi_ctx_t *ctx = user_data;
-  const char *password = lv_textarea_get_text(ctx->password);
-  char credential_path[PATH_LEN];
-  snprintf(credential_path, sizeof(credential_path), "%s/system/wifi.txt", SIM_ROOT);
-  FILE *file = fopen(credential_path, "wb");
-  if (file) {
-    fprintf(file, "%s\n%s\n", ctx->ssid, password);
-    fclose(file);
-  }
-  strncpy(connected_ssid, ctx->ssid, sizeof(connected_ssid) - 1);
-  connected_ssid[sizeof(connected_ssid) - 1] = '\0';
-  wm_update_wifi_status(true);
-  wm_keyboard_hide();
-  lv_obj_del(ctx->modal);
-  wm_toast("Connected (simulated radio)", 1800);
-  free(ctx);
+static bool ask_windows_about_wifi(void) {
+  memset(connected_ssid, 0, sizeof(connected_ssid));
+  bool connected = sim_host_wifi_get_current(connected_ssid,
+                                             sizeof(connected_ssid));
+  wm_update_wifi_status(connected);
+  return connected;
 }
 
-static void wifi_cancel(lv_obj_t *object, void *user_data) {
+static void wifi_refresh(lv_obj_t *object, void *user_data) {
   (void)object;
-  wifi_ctx_t *ctx = user_data;
-  wm_keyboard_hide();
-  lv_obj_del(ctx->modal);
-  free(ctx);
-}
-
-static void wifi_network(lv_obj_t *object, void *user_data) {
-  (void)object;
-  const char *ssid = user_data;
-  wifi_ctx_t *ctx = calloc(1, sizeof(*ctx));
-  strncpy(ctx->ssid, ssid, sizeof(ctx->ssid) - 1);
-  ctx->modal = lv_obj_create(lv_layer_top());
-  lv_obj_set_size(ctx->modal, 282, 184);
-  lv_obj_center(ctx->modal);
-  lv_obj_set_style_bg_color(ctx->modal, lv_color_hex(0x172126), 0);
-  lv_obj_set_style_border_color(ctx->modal, lv_color_hex(0x25C8EF), 0);
-  lv_obj_set_style_radius(ctx->modal, 12, 0);
-  lv_obj_t *heading = wm_add_text(ctx->modal, ctx->ssid);
-  lv_obj_align(heading, LV_ALIGN_TOP_MID, 0, 14);
-  ctx->password = wm_add_input(ctx->modal, "Password (any value)", true);
-  lv_obj_align(ctx->password, LV_ALIGN_CENTER, 0, -4);
-  lv_obj_t *cancel = wm_add_button(ctx->modal, "Cancel", 94, 32);
-  lv_obj_align(cancel, LV_ALIGN_BOTTOM_LEFT, 12, -10);
-  wm_on_tap(cancel, wifi_cancel, ctx);
-  lv_obj_t *connect = wm_add_button(ctx->modal, "Connect", 94, 32);
-  lv_obj_align(connect, LV_ALIGN_BOTTOM_RIGHT, -12, -10);
-  wm_on_tap(connect, wifi_connect, ctx);
+  lv_obj_t *status_label = user_data;
+  bool connected = ask_windows_about_wifi();
+  char status[80];
+  snprintf(status, sizeof(status), "Host Wi-Fi: %s",
+           connected ? connected_ssid : "Not connected or unavailable");
+  lv_label_set_text(status_label, status);
+  lv_obj_set_style_text_color(status_label,
+                              connected ? lv_color_hex(0x52E3AC)
+                                        : lv_color_hex(0xA4B1B6),
+                              0);
+  wm_toast(connected ? "Host Wi-Fi status refreshed"
+                    : "No host Wi-Fi connection",
+           1400);
 }
 
 static void wifi_create(lv_obj_t *parent) {
-  static const char *networks[] = {"Vantage Lab", "Studio Guest", "Mobile Dev"};
-  static const char *signals[] = {"-42 dBm", "-58 dBm", "-71 dBm"};
   lv_obj_t *window = wm_create_window(parent, "Wi-Fi Settings");
+  bool connected = ask_windows_about_wifi();
   char status[80];
-  snprintf(status, sizeof(status), "Status: %s", wifi_connected ? connected_ssid : "Not connected");
+  snprintf(status, sizeof(status), "Host Wi-Fi: %s",
+           connected ? connected_ssid : "Not connected or unavailable");
   lv_obj_t *state = wm_add_text(window, status);
-  lv_obj_set_style_text_color(state, wifi_connected ? lv_color_hex(0x52E3AC) : lv_color_hex(0xA4B1B6), 0);
-  lv_obj_t *notice = wm_add_text(window, "Deterministic scan results — no host radio is changed.");
+  lv_obj_set_style_text_color(state,
+                              connected ? lv_color_hex(0x52E3AC)
+                                        : lv_color_hex(0xA4B1B6),
+                              0);
+  lv_obj_t *notice = wm_add_text(window,
+      "Read-only host status. The simulator never changes your Wi-Fi connection.");
+  lv_label_set_long_mode(notice, LV_LABEL_LONG_WRAP);
+  lv_obj_set_width(notice, 282);
   lv_obj_set_style_text_font(notice, &lv_font_montserrat_10, 0);
   lv_obj_set_style_text_color(notice, lv_color_hex(0x91ABB3), 0);
-  lv_obj_t *list = wm_create_scroll_list(window, 300, 286);
-  for (unsigned int i = 0; i < sizeof(networks) / sizeof(networks[0]); ++i) {
-    char text[64];
-    snprintf(text, sizeof(text), "%s  %s", networks[i], signals[i]);
-    lv_obj_t *item = lv_list_add_btn(list, LV_SYMBOL_WIFI, text);
-    wm_on_tap(item, wifi_network, (void *)networks[i]);
-  }
+  lv_obj_t *refresh = wm_add_button(window, "Refresh host Wi-Fi", 230, 40);
+  wm_on_tap(refresh, wifi_refresh, state);
 }
 
 static bool host_is_directory(const char *path) {

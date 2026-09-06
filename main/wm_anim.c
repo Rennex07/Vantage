@@ -123,7 +123,8 @@ void wm_animate_launch(lv_obj_t *src, lv_obj_t *target) {
   lv_anim_set_completed_cb(&a, ghost_del_cb);
   lv_anim_start(&a);
 
-  /* Bring the destination in early enough that the two surfaces overlap. */
+  /* The early overlap is the whole visual trick. It looks deceptively simple;
+   * please profile before "cleaning it up" and bringing back the hard cut. */
   lv_anim_init(&a);
   lv_anim_set_var(&a, target);
   lv_anim_set_values(&a, LV_OPA_TRANSP, LV_OPA_COVER);

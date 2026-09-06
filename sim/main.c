@@ -3,7 +3,9 @@
 #include <SDL2/SDL.h>
 #include <stdio.h>
 
-int main(void) {
+int main(int argc, char *argv[]) {
+  (void)argc;
+  (void)argv;
   lv_init();
 
   lv_display_t *disp = lv_sdl_window_create(320, 480);

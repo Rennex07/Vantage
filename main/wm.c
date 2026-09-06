@@ -172,6 +172,7 @@ static void host_lv_obj_set_style_text_color_hex(lv_obj_t *obj,
 extern void *sdk_add_button(void *parent, const char *label,
                             void (*on_click_cb)(void *user_data),
                             void *user_data);
+extern void *sdk_create_window(const char *title);
 extern void *sdk_add_text(void *parent, const char *text);
 extern void sdk_show_toast(const char *message, uint32_t duration_ms);
 extern void sdk_get_data_path(const char *filename, char *out_path,
@@ -192,6 +193,9 @@ static const esp_elf_symbol_table_t host_symbols[] = {
     {"printf", (void *)printf},
 
     // System APIs
+    {"sdk_create_window", (void *)sdk_create_window},
+    {"sdk_add_button", (void *)sdk_add_button},
+    {"sdk_add_text", (void *)sdk_add_text},
     {"sdk_show_toast", (void *)sdk_show_toast},
     {"sdk_get_data_path", (void *)sdk_get_data_path},
 
