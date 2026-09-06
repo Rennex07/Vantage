@@ -1,6 +1,7 @@
 #include "lvgl.h"
 #include "wm.h"
 #include <SDL2/SDL.h>
+#include <stdio.h>
 
 int main(void) {
   lv_init();
