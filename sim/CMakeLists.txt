@@ -16,6 +16,9 @@ add_subdirectory(
   "${CMAKE_CURRENT_SOURCE_DIR}/../components/lvgl"
   "${CMAKE_CURRENT_BINARY_DIR}/lvgl")
 
+# Add SDL2 include path to LVGL target to fix header issues
+target_include_directories(lvgl PRIVATE ${SDL2_INCLUDE_DIRS})
+
 add_executable(vantage_sim
   main.c
   wm.c
@@ -25,6 +28,7 @@ add_executable(vantage_sim
 target_include_directories(vantage_sim PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}"
   "${CMAKE_CURRENT_SOURCE_DIR}/../main"
+  ${SDL2_INCLUDE_DIRS}
 )
 
-target_link_libraries(vantage_sim PRIVATE lvgl SDL2::SDL2)
+target_link_libraries(vantage_sim PRIVATE lvgl ${SDL2_LIBRARIES})

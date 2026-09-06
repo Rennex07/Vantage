@@ -7,7 +7,7 @@
 #define LV_COLOR_DEPTH 32
 #define LV_MEM_SIZE (512 * 1024U)
 
-#define LV_USE_OS LV_OS_PTHREAD
+#define LV_USE_OS LV_OS_WINDOWS
 
 /* Use the SDL window/mouse/keyboard driver. */
 #define LV_USE_SDL 1

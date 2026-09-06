@@ -120,11 +120,13 @@ void wm_animate_launch(lv_obj_t *src, lv_obj_t *target) {
   lv_anim_set_deleted_cb(&a, ghost_del_cb);
   lv_anim_start(&a);
 
-  /* Fade in the target. */
+  /* Fade in the target starting halfway through the animation for smoother transition. */
   lv_anim_init(&a);
   lv_anim_set_var(&a, target);
   lv_anim_set_values(&a, LV_OPA_TRANSP, LV_OPA_COVER);
-  lv_anim_set_duration(&a, 250);
+  lv_anim_set_duration(&a, 150);
+  lv_anim_set_delay(&a, 150);  /* Start fade-in at 50% progress */
+  lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
   lv_anim_set_exec_cb(&a, anim_set_opa_cb);
   lv_anim_start(&a);
 }
