@@ -1,0 +1,353 @@
+use std::{error::Error, ffi::CStr, io, os::unix::net::UnixStream, path::Path, time::Instant};
+
+use signal_hook::{
+    consts::{SIGINT, SIGTERM},
+    low_level::pipe,
+};
+use smithay::{
+    backend::{
+        allocator::{
+            Fourcc,
+            gbm::{GbmAllocator, GbmBufferFlags, GbmDevice},
+        },
+        drm::{DrmDevice, DrmDeviceFd, DrmDeviceNotifier, DrmEvent, GbmBufferedSurface},
+        egl::{EGLContext, EGLDisplay},
+        libinput::{LibinputInputBackend, LibinputSessionInterface},
+        renderer::{
+            Bind,
+            gles::{GlesRenderer, ffi},
+        },
+        session::{Event as SessionEvent, Session, libseat::LibSeatSession},
+        udev::{all_gpus, primary_gpu},
+    },
+    output::{Mode, PhysicalProperties, Subpixel},
+    reexports::{
+        calloop::{EventLoop, Interest, Mode as PollMode, PostAction, generic::Generic},
+        drm::control::{Device, Mode as DrmMode, ModeTypeFlags, connector, crtc},
+        input::Libinput,
+        rustix::fs::OFlags,
+    },
+    utils::{DeviceFd, Transform},
+};
+
+use crate::{
+    session::{Scene, Server},
+    shell::launch,
+    wayland::{Shortcut, State},
+};
+
+type Result<T> = std::result::Result<T, Box<dyn Error>>;
+type Scanout = GbmBufferedSurface<GbmAllocator<DrmDeviceFd>, ()>;
+
+pub fn run() -> Result<()> {
+    let (mut session, session_events) = LibSeatSession::new()?;
+    let seat = session.seat();
+    if !session.is_active() {
+        return Err("Start Vantage from an active local TTY login".into());
+    }
+    let mut outputs = all_gpus(&seat)?;
+    if let Some(primary) = primary_gpu(&seat)?
+        && let Some(index) = outputs.iter().position(|path| *path == primary)
+    {
+        outputs.swap(0, index);
+    }
+    let (kms, drm_events) = outputs
+        .iter()
+        .find_map(|path| match Kms::open(&mut session, path) {
+            Ok(output) => Some(output),
+            Err(error) => {
+                eprintln!("Could not use {}: {error}", path.display());
+                None
+            }
+        })
+        .ok_or("No DRM device with a usable connected output on the active seat")?;
+
+    let mut input = Libinput::new_with_udev(LibinputSessionInterface::from(session.clone()));
+    input
+        .udev_assign_seat(&seat)
+        .map_err(|()| io::Error::other("Could not assign libinput seat"))?;
+
+    let mut event_loop = EventLoop::<Native>::try_new()?;
+    let handle = event_loop.handle();
+    let mut server = Server::new(&handle)?;
+    let mut state = State::with_output(
+        &server.handle(),
+        kms.name.clone(),
+        kms.properties(),
+        kms.mode.into(),
+    )?;
+    state.advertise_dmabuf(&kms.renderer);
+    let mut native = Native {
+        kms,
+        state,
+        session,
+        input: input.clone(),
+        pending_flip: false,
+        error: None,
+    };
+    handle.insert_source(drm_events, |event, _, native| match event {
+        DrmEvent::VBlank(crtc) if crtc == native.kms.scanout.crtc() && native.pending_flip => {
+            native.pending_flip = false;
+            match native.kms.scanout.frame_submitted() {
+                Ok(Some(())) => native.state.frame_presented(Instant::now()),
+                Ok(None) => (),
+                Err(error) => native.error = Some(error.into()),
+            }
+        }
+        DrmEvent::Error(error) => native.error = Some(error.into()),
+        _ => (),
+    })?;
+    handle.insert_source(session_events, |event, _, native| {
+        if let Err(error) = native.session_event(event) {
+            native.error = Some(error);
+        }
+    })?;
+    let socket = server.socket.clone();
+    let app_exits = server.app_exits.clone();
+    handle.insert_source(LibinputInputBackend::new(input), move |event, _, native| {
+        if !native.session.is_active() {
+            return;
+        }
+        let (mut exit, mut vt) = (false, None);
+        native.state.input(
+            event,
+            |app, started| launch::open(app, started, &socket, &app_exits),
+            Some(&mut |shortcut| match shortcut {
+                Shortcut::Exit => exit = true,
+                Shortcut::SwitchVt(number) => vt = Some(number),
+            }),
+        );
+        native.state.closed |= exit;
+        if let Some(vt) = vt
+            && let Err(error) = native.session.change_vt(vt)
+        {
+            eprintln!("Could not switch to VT {vt}: {error}");
+        }
+    })?;
+    let (exit_reader, exit_writer) = UnixStream::pair()?;
+    pipe::register(SIGINT, exit_writer.try_clone()?)?;
+    pipe::register(SIGTERM, exit_writer)?;
+    handle.insert_source(
+        Generic::new(exit_reader, Interest::READ, PollMode::Level),
+        |_, _, native| {
+            native.state.closed = true;
+            Ok(PostAction::Remove)
+        },
+    )?;
+
+    println!(
+        "Vantage on {seat}, {} {} ({}), {} logical CPUs available",
+        native.kms.name,
+        native.kms.mode.name().to_string_lossy(),
+        native.kms.renderer_name,
+        std::thread::available_parallelism().map_or(1, |count| count.get()),
+    );
+    println!("WAYLAND_DISPLAY={}", server.socket.to_string_lossy());
+    while !native.state.closed {
+        if let Some(error) = native.error.take() {
+            return Err(error);
+        }
+        server.dispatch(&mut native.state)?;
+        native
+            .state
+            .import_pending_dmabufs(&mut native.kms.renderer);
+        server.flush()?;
+        if native.session.is_active()
+            && !native.pending_flip
+            && (native.state.redraw || native.kms.scene.is_animating(&native.state))
+        {
+            native.state.redraw = false;
+            native.kms.draw(&mut native.state)?;
+            native.pending_flip = true;
+        }
+        // Page flips pace animation and coalesce bursts of client or input activity.
+        event_loop.dispatch(None, &mut native)?;
+    }
+    Ok(())
+}
+
+struct Native {
+    kms: Kms,
+    state: State,
+    session: LibSeatSession,
+    input: Libinput,
+    pending_flip: bool,
+    error: Option<Box<dyn Error>>,
+}
+
+impl AsMut<State> for Native {
+    fn as_mut(&mut self) -> &mut State {
+        &mut self.state
+    }
+}
+
+impl Native {
+    fn session_event(&mut self, event: SessionEvent) -> Result<()> {
+        match event {
+            SessionEvent::PauseSession => {
+                self.input.suspend();
+                self.kms.drm.pause();
+                self.state.host_focus(false);
+            }
+            SessionEvent::ActivateSession => {
+                self.kms.drm.activate(true)?;
+                // A page flip pending before the VT switch may never arrive.
+                if self.pending_flip {
+                    self.kms.scanout.frame_submitted()?;
+                    self.pending_flip = false;
+                }
+                self.kms.scanout.reset_buffers();
+                self.input
+                    .resume()
+                    .map_err(|()| io::Error::other("Could not resume libinput"))?;
+                self.state.host_focus(true);
+                self.state.redraw = true;
+            }
+        }
+        Ok(())
+    }
+}
+
+struct Kms {
+    scanout: Scanout,
+    scene: Scene,
+    renderer: GlesRenderer,
+    drm: DrmDevice,
+    mode: DrmMode,
+    name: String,
+    dimensions: (i32, i32),
+    renderer_name: String,
+}
+
+impl Kms {
+    fn open(session: &mut LibSeatSession, path: &Path) -> Result<(Self, DrmDeviceNotifier)> {
+        let fd = session.open(path, OFlags::RDWR | OFlags::CLOEXEC | OFlags::NONBLOCK)?;
+        let fd = DrmDeviceFd::new(DeviceFd::from(fd));
+        let (mut drm, events) = DrmDevice::new(fd.clone(), false)?;
+        let gbm = GbmDevice::new(fd)?;
+        // EGL retains a clone of the GBM device until the context is dropped.
+        let display = unsafe { EGLDisplay::new(gbm.clone())? };
+        let context = EGLContext::new(&display)?;
+        // This thread owns the context, renderer, and all GL targets.
+        let mut renderer = unsafe { GlesRenderer::new(context)? };
+        let renderer_name = renderer.with_context(|gl| {
+            // GL_RENDERER is a context-owned, NUL-terminated string when available.
+            let name = unsafe { gl.GetString(ffi::RENDERER) };
+            if name.is_null() {
+                "unknown GLES renderer".to_owned()
+            } else {
+                unsafe { CStr::from_ptr(name.cast()) }
+                    .to_string_lossy()
+                    .into_owned()
+            }
+        })?;
+        let scene = Scene::new(&mut renderer, true)?;
+        let formats = renderer.egl_context().display().dmabuf_render_formats();
+        let mut failure = None;
+        for (connector, crtc, mode) in connected_outputs(&drm)? {
+            let surface = match drm.create_surface(crtc, mode, &[connector.handle()]) {
+                Ok(surface) => surface,
+                Err(error) => {
+                    failure = Some(Box::new(error) as Box<dyn Error>);
+                    continue;
+                }
+            };
+            let allocator = GbmAllocator::new(
+                gbm.clone(),
+                GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT,
+            );
+            match GbmBufferedSurface::new(
+                surface,
+                allocator,
+                &[Fourcc::Xrgb8888, Fourcc::Argb8888],
+                formats.iter().copied(),
+            ) {
+                Ok(scanout) => {
+                    let name = format!(
+                        "{}-{}",
+                        connector.interface().as_str(),
+                        connector.interface_id()
+                    );
+                    let dimensions = connector
+                        .size()
+                        .map_or((0, 0), |(w, h)| (w as i32, h as i32));
+                    println!("DRM device: {}", path.display());
+                    return Ok((
+                        Self {
+                            scanout,
+                            scene,
+                            renderer,
+                            drm,
+                            mode,
+                            name,
+                            dimensions,
+                            renderer_name,
+                        },
+                        events,
+                    ));
+                }
+                Err(error) => failure = Some(Box::new(error)),
+            }
+        }
+        Err(failure
+            .unwrap_or_else(|| "No connected DRM connector with an available mode and CRTC".into()))
+    }
+
+    fn properties(&self) -> PhysicalProperties {
+        PhysicalProperties {
+            size: self.dimensions.into(),
+            subpixel: Subpixel::Unknown,
+            make: "Vantage".into(),
+            model: self.name.clone(),
+        }
+    }
+
+    fn draw(&mut self, state: &mut State) -> Result<()> {
+        let (mut buffer, _) = self.scanout.next_buffer()?;
+        let mut target = self.renderer.bind(&mut buffer)?;
+        let sync = self.scene.draw(
+            state,
+            &mut self.renderer,
+            &mut target,
+            Mode::from(self.mode).size,
+            Transform::Normal,
+            1.0,
+        )?;
+        self.scanout.queue_buffer(Some(sync), None, ())?;
+        Ok(())
+    }
+}
+
+fn connected_outputs(drm: &DrmDevice) -> Result<Vec<(connector::Info, crtc::Handle, DrmMode)>> {
+    let resources = drm.resource_handles()?;
+    let mut outputs = Vec::new();
+    for &handle in resources.connectors() {
+        let connector = drm.get_connector(handle, true)?;
+        if connector.state() != connector::State::Connected || connector.modes().is_empty() {
+            continue;
+        }
+        let current_crtc = connector
+            .current_encoder()
+            .and_then(|encoder| drm.get_encoder(encoder).ok())
+            .and_then(|encoder| encoder.crtc());
+        let mut crtcs = Vec::new();
+        crtcs.extend(current_crtc);
+        for encoder in connector.encoders() {
+            if let Ok(encoder) = drm.get_encoder(*encoder) {
+                for crtc in resources.filter_crtcs(encoder.possible_crtcs()) {
+                    if !crtcs.contains(&crtc) {
+                        crtcs.push(crtc);
+                    }
+                }
+            }
+        }
+        let mut modes = connector.modes().to_vec();
+        modes.sort_by_key(|mode| !mode.mode_type().contains(ModeTypeFlags::PREFERRED));
+        for mode in modes {
+            for &crtc in &crtcs {
+                outputs.push((connector.clone(), crtc, mode));
+            }
+        }
+    }
+    Ok(outputs)
+}

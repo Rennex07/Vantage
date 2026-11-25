@@ -1,0 +1,8 @@
+[package]
+name = "vantage-input-test"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+smithay = { version = "0.7.0", default-features = false, features = ["backend_winit"] }
+x11rb = "0.13"

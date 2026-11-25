@@ -1,0 +1,25 @@
+[package]
+name = "vantage"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-only"
+
+[[bin]]
+name = "vantage"
+path = "src/main.rs"
+
+[dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }
+signal-hook = "0.3"
+tempfile = "3"
+smithay = { version = "0.7.0", default-features = false, features = [
+    "backend_drm",
+    "backend_gbm",
+    "backend_libinput",
+    "backend_session_libseat",
+    "backend_udev",
+    "backend_winit",
+    "desktop",
+    "wayland_frontend",
+] }
+vte4 = { version = "0.10", features = ["gtk_v4_18"] }
