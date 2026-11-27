@@ -9,10 +9,7 @@ use smithay::{
     },
     delegate_xdg_shell,
     desktop::{PopupKind, Space, Window, WindowSurfaceType, space::SpaceElement},
-    reexports::wayland_server::{
-        Resource,
-        protocol::{wl_seat::WlSeat, wl_surface::WlSurface},
-    },
+    reexports::wayland_server::protocol::{wl_seat::WlSeat, wl_surface::WlSurface},
     utils::{Logical, Physical, Point, Rectangle, SERIAL_COUNTER, Scale, Serial, Size},
     wayland::{
         compositor::{get_parent, is_sync_subsurface, with_states},
@@ -85,19 +82,25 @@ impl State {
             let location = centered_location(&window, output.size);
             self.opening_windows
                 .retain(|(opening, _)| opening != &window);
-            self.opening_windows
-                .push((window.clone(), Opening::new(Instant::now(), launch)));
+            if !self.appearance.reduce_motion {
+                self.opening_windows
+                    .push((window.clone(), Opening::new(Instant::now(), launch)));
+            }
             let active = workspace == self.workspaces.active;
             self.spaces[workspace].map_element(window.clone(), location, active);
-            if active && self.host_focused {
+            if active && self.host_focused && !self.overview.open && !self.lock_active() {
                 self.focus_window(Some(&window));
             }
-        } else if index == self.workspaces.active && !was_empty && window.bbox().size.is_empty() {
-            self.focus_last_window();
+        } else if !was_empty && window.bbox().size.is_empty() {
+            self.minimized_windows.retain(|other| other != &window);
+            if index == self.workspaces.active {
+                self.focus_last_window();
+            }
         }
+        self.apply_window_geometry(&window);
     }
 
-    fn find_window(&self, root: &WlSurface) -> Option<(usize, Window)> {
+    pub(super) fn find_window(&self, root: &WlSurface) -> Option<(usize, Window)> {
         self.spaces.iter().enumerate().find_map(|(index, space)| {
             space
                 .elements()
@@ -116,13 +119,16 @@ impl State {
             return;
         }
         self.dragged_window = None;
+        self.finish_resize();
         self.focus_window(None);
-        self.workspaces.select(index, Instant::now());
+        self.workspaces
+            .select(index, Instant::now(), !self.appearance.reduce_motion);
         self.focus_last_window();
     }
 
     pub(super) fn focus_window(&mut self, target: Option<&Window>) {
         if let Some(window) = target {
+            self.minimized_windows.retain(|other| other != window);
             self.spaces[self.workspaces.active].raise_element(window, true);
         }
         for window in self.spaces[self.workspaces.active].elements() {
@@ -144,15 +150,91 @@ impl State {
     }
 
     pub(super) fn focus_last_window(&mut self) {
-        if !self.host_focused {
+        if !self.host_focused || self.overview.open || self.lock_active() {
             return;
         }
         let window = self.spaces[self.workspaces.active]
             .elements()
             .rev()
-            .find(|window| !window.bbox().size.is_empty())
+            .find(|window| {
+                !window.bbox().size.is_empty() && !self.minimized_windows.contains(window)
+            })
             .cloned();
         self.focus_window(window.as_ref());
+    }
+
+    pub(super) fn focused_window(&self) -> Option<Window> {
+        let surface = self.keyboard.current_focus()?;
+        self.find_window(&surface).map(|(_, window)| window)
+    }
+
+    pub(super) fn minimize_focused_window(&mut self) {
+        if let Some(window) = self.focused_window() {
+            self.minimize_window(window);
+        }
+    }
+
+    fn minimize_window(&mut self, window: Window) {
+        if window.bbox().size.is_empty() || self.minimized_windows.contains(&window) {
+            return;
+        }
+        let focused = self.focused_window().as_ref() == Some(&window);
+        self.minimized_windows.push(window);
+        if focused {
+            self.focus_last_window();
+        }
+        self.redraw = true;
+    }
+
+    pub(super) fn restore_dock_window(&mut self, app: App) -> bool {
+        let target = self
+            .minimized_windows
+            .iter()
+            .rev()
+            .find(|window| {
+                !window.bbox().size.is_empty()
+                    && self.spaces[self.workspaces.active]
+                        .element_location(window)
+                        .is_some()
+                    && window_app(window) == Some(app)
+            })
+            .cloned();
+        if let Some(window) = target {
+            self.focus_window(Some(&window));
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(super) fn close_focused_window(&self) {
+        if let Some(surface) = self.keyboard.current_focus()
+            && let Some((_, window)) = self.find_window(&surface)
+            && let Some(toplevel) = window.toplevel()
+        {
+            toplevel.send_close();
+        }
+    }
+
+    pub(super) fn focus_pinned_window(&mut self, id: &str) -> bool {
+        let name = id.strip_suffix(".desktop").unwrap_or(id);
+        let target = self.spaces[self.workspaces.active]
+            .elements()
+            .rev()
+            .find(|window| {
+                !window.bbox().size.is_empty()
+                    && with_app_id(window, |app_id| {
+                        app_id.eq_ignore_ascii_case(name) || app_id.eq_ignore_ascii_case(id)
+                    })
+                    .unwrap_or(false)
+            })
+            .cloned();
+        if let Some(window) = target {
+            self.focus_window(Some(&window));
+            true
+        } else {
+            false
+        }
     }
 
     pub(super) fn window_under(
@@ -164,6 +246,9 @@ impl State {
         let offset = self.workspace_offset(active, self.workspaces.position(now));
         let space = &self.spaces[active];
         space.elements().rev().find_map(|window| {
+            if self.minimized_windows.contains(window) {
+                return None;
+            }
             let target = self.window_target(space, window, offset)?;
             let pose = self.window_pose(window, target, now);
             // Wayland pointer coordinates are translation-only. The client can receive
@@ -196,18 +281,56 @@ impl State {
     ) -> WindowScene {
         self.popups.cleanup();
         let mut windows = WindowScene::default();
+        let overview = self.overview.amount(now);
+        self.overview.visible_cards.clear();
         for index in 0..self.spaces.len() {
             self.spaces[index].refresh();
-            if (index as f64 - position).abs() >= 1.0 {
+            if (index as f64 - position).abs() >= 1.0
+                || (overview == 1.0 && index != self.workspaces.active)
+            {
                 continue;
             }
             let space = &self.spaces[index];
             let offset = self.workspace_offset(index, position);
             for window in space.elements_for_output(&self.output).rev() {
+                let minimized = self.minimized_windows.contains(window);
+                if minimized && (index != self.workspaces.active || overview == 0.0) {
+                    continue;
+                }
                 let Some(target) = self.window_target(space, window, offset) else {
                     continue;
                 };
-                let pose = self.window_pose(window, target, now);
+                let mut pose = self.window_pose(window, target, now);
+                if minimized {
+                    pose.opacity *= overview as f32;
+                }
+                if overview > 0.0
+                    && index == self.workspaces.active
+                    && let Some(card) = self
+                        .overview
+                        .cards
+                        .iter()
+                        .find(|card| card.window == *window)
+                {
+                    let thumbnail = card.thumbnail;
+                    pose.rect = Rectangle::new(
+                        (
+                            pose.rect.loc.x + (thumbnail.loc.x - pose.rect.loc.x) * overview,
+                            pose.rect.loc.y + (thumbnail.loc.y - pose.rect.loc.y) * overview,
+                        )
+                            .into(),
+                        (
+                            pose.rect.size.w + (thumbnail.size.w - pose.rect.size.w) * overview,
+                            pose.rect.size.h + (thumbnail.size.h - pose.rect.size.h) * overview,
+                        )
+                            .into(),
+                    );
+                    if pose.opacity > 0.0 {
+                        self.overview
+                            .visible_cards
+                            .push((window.clone(), pose.rect));
+                    }
+                }
                 if pose.opacity == 0.0 {
                     continue;
                 }
@@ -226,7 +349,7 @@ impl State {
                 windows.elements.extend(elements.into_iter().map(|element| {
                     RescaleRenderElement::from_element(element, (pivot.x, pivot.y).into(), scale)
                 }));
-                if window_app(window) == Some(App::Files) {
+                if let Some(theme) = frost_theme(window, self.appearance.theme) {
                     let size = pose.rect.size.to_i32_round();
                     let bounds: Rectangle<i32, Physical> =
                         Rectangle::new((pivot.x, pivot.y).into(), (size.w, size.h).into());
@@ -234,6 +357,7 @@ impl State {
                         behind: windows.elements.len(),
                         bounds,
                         opacity: pose.opacity,
+                        theme,
                     });
                 }
             }
@@ -310,19 +434,37 @@ impl State {
             .into()
     }
 
-    pub fn frame_presented(&self, time: Instant) {
+    pub fn frame_presented(&mut self, time: Instant, locked_frame: bool) {
+        let stamp = smithay::utils::Clock::<smithay::utils::Monotonic>::new().now();
+        if self.lock_active() {
+            if locked_frame {
+                self.lock_frame_presented(stamp.into());
+            }
+            return;
+        }
+        if let smithay::input::pointer::CursorImageStatus::Surface(surface) = &self.cursor {
+            smithay::desktop::utils::send_frames_surface_tree(
+                surface,
+                &self.output,
+                stamp,
+                Some(Duration::ZERO),
+                |_, _| Some(self.output.clone()),
+            );
+        }
         let position = self.workspaces.position(time);
         for (index, space) in self.spaces.iter().enumerate() {
-            if (index as f64 - position).abs() >= 1.0 {
+            if (index as f64 - position).abs() >= 1.0
+                && !(self.overview.open && index == self.workspaces.active)
+            {
                 continue;
             }
             for window in space.elements_for_output(&self.output) {
-                window.send_frame(
-                    &self.output,
-                    time.duration_since(self.started),
-                    Some(Duration::ZERO),
-                    |_, _| Some(self.output.clone()),
-                );
+                if self.minimized_windows.contains(window) && self.overview.amount(time) == 0.0 {
+                    continue;
+                }
+                window.send_frame(&self.output, stamp, Some(Duration::ZERO), |_, _| {
+                    Some(self.output.clone())
+                });
             }
         }
     }
@@ -336,7 +478,10 @@ impl State {
             return;
         };
         let target = drag.location + (pointer - drag.pointer).to_i32_round();
-        let top = (BAR_HEIGHT as i32 + 2).min(output.size.h.saturating_sub(1));
+        let top = self
+            .status_hits
+            .map_or(BAR_HEIGHT as i32, |(bar, _)| bar.size.h);
+        let top = (top + 2).min(output.size.h.saturating_sub(1));
         let location = (
             target.x.clamp(
                 (80 - drag.window.geometry().size.w).min(0),
@@ -348,22 +493,83 @@ impl State {
         self.redraw = true;
     }
 
+    pub(super) fn finish_move(&mut self, pointer: Point<f64, Logical>) {
+        let Some(drag) = self.dragged_window.take() else {
+            return;
+        };
+        if let Some((layout, _)) = self.snap_target(pointer) {
+            self.place_window(&drag.window, layout);
+        }
+        self.redraw = true;
+    }
+
+    fn snap_target(
+        &self,
+        pointer: Point<f64, Logical>,
+    ) -> Option<(geometry::Layout, Rectangle<i32, Logical>)> {
+        let area = self.work_area(self.workspaces.active)?;
+        let layout = if pointer.x <= 12.0 {
+            geometry::Layout::Left
+        } else if pointer.x >= f64::from(area.size.w - 12) {
+            geometry::Layout::Right
+        } else if pointer.y < f64::from(area.loc.y) {
+            geometry::Layout::Maximized
+        } else {
+            return None;
+        };
+        Some((layout, layout.bounds(area)))
+    }
+
+    pub fn snap_preview(&self) -> Option<Rectangle<i32, Physical>> {
+        let drag = self.dragged_window.as_ref()?;
+        let (layout, area) = self.snap_target(self.pointer.current_location())?;
+        if !geometry::can_place(&drag.window, layout, area) {
+            return None;
+        }
+        Some(area.to_physical(1))
+    }
+
     pub(super) fn center_windows(&mut self) {
         self.dragged_window = None;
+        self.finish_resize();
         for space in &mut self.spaces {
             let Some(output) = space.output_geometry(&self.output) else {
                 continue;
             };
             let windows = space.elements().cloned().collect::<Vec<_>>();
             for window in windows {
+                if geometry::has_maximized_geometry(&window) {
+                    continue;
+                }
                 let location = centered_location(&window, output.size);
                 space.map_element(window, location, false);
             }
         }
+        self.refresh_maximized_windows();
     }
 }
 
+fn frost_theme(window: &Window, theme: crate::palette::Theme) -> Option<crate::palette::Theme> {
+    with_app_id(window, |app_id| {
+        if App::Files.matches(app_id) {
+            // Thunar imports the launch palette. Its backdrop must keep the same contrast.
+            window.user_data().insert_if_missing(|| theme);
+            window.user_data().get::<crate::palette::Theme>().copied()
+        } else {
+            (app_id == "org.vantage.Settings").then_some(theme)
+        }
+    })
+    .flatten()
+}
+
 fn window_app(window: &Window) -> Option<App> {
+    with_app_id(window, |id| {
+        App::ALL.into_iter().find(|app| app.matches(id))
+    })
+    .flatten()
+}
+
+fn with_app_id<T>(window: &Window, read: impl FnOnce(&str) -> T) -> Option<T> {
     let surface = window.toplevel()?.wl_surface();
     with_states(surface, |states| {
         let data = states
@@ -372,7 +578,7 @@ fn window_app(window: &Window) -> Option<App> {
             .lock()
             .ok()?;
         let id = data.app_id.as_deref()?;
-        App::ALL.into_iter().find(|app| app.matches(id))
+        Some(read(id))
     })
 }
 
@@ -394,6 +600,10 @@ impl XdgShellHandler for State {
         let space = &mut self.spaces[self.workspaces.active];
         if let Some(output) = space.output_geometry(&self.output) {
             surface.with_pending_state(|state| {
+                state.capabilities.replace([
+                    geometry::WmCapabilities::Maximize,
+                    geometry::WmCapabilities::Minimize,
+                ]);
                 state.bounds =
                     Some(((output.size.w - 24).max(1), (output.size.h - 130).max(1)).into());
             });
@@ -402,30 +612,49 @@ impl XdgShellHandler for State {
     }
 
     fn move_request(&mut self, surface: ToplevelSurface, _: WlSeat, serial: Serial) {
-        if !self.pointer.has_grab(serial) {
-            return;
-        }
-        let Some(grab) = self.pointer.grab_start_data() else {
+        let Some(pointer) = self.drag_origin(&surface, serial) else {
             return;
         };
-        if grab.button != BUTTON_LEFT
-            || !grab
-                .focus
-                .is_some_and(|(focus, _)| focus.id().same_client_as(&surface.wl_surface().id()))
-        {
-            return;
-        }
         let Some((index, window)) = self.find_window(surface.wl_surface()) else {
             return;
         };
         if index == self.workspaces.active
-            && let Some(location) = self.spaces[index].element_location(&window)
+            && let Some(mut location) = self.spaces[index].element_location(&window)
         {
+            if let Some(restored) = self.restore_for_drag(&window) {
+                let width = f64::from(window.geometry().size.w.max(1));
+                let fraction = ((pointer.x - f64::from(location.x)) / width).clamp(0.0, 1.0);
+                location.x = (pointer.x - fraction * f64::from(restored.w)).round() as i32;
+            }
             self.dragged_window = Some(WindowDrag {
                 window,
                 location,
-                pointer: grab.location,
+                pointer,
             });
+        }
+    }
+
+    fn resize_request(
+        &mut self,
+        surface: ToplevelSurface,
+        _: WlSeat,
+        serial: Serial,
+        edge: geometry::ResizeEdge,
+    ) {
+        self.start_resize(surface, serial, edge);
+    }
+
+    fn maximize_request(&mut self, surface: ToplevelSurface) {
+        self.set_maximized(&surface, true);
+    }
+
+    fn unmaximize_request(&mut self, surface: ToplevelSurface) {
+        self.set_maximized(&surface, false);
+    }
+
+    fn minimize_request(&mut self, surface: ToplevelSurface) {
+        if let Some((_, window)) = self.find_window(surface.wl_surface()) {
+            self.minimize_window(window);
         }
     }
 
@@ -433,6 +662,8 @@ impl XdgShellHandler for State {
         if let Some((index, window)) = self.find_window(surface.wl_surface()) {
             let focused = self.keyboard.current_focus().as_ref() == Some(surface.wl_surface());
             self.spaces[index].unmap_elem(&window);
+            self.minimized_windows.retain(|other| other != &window);
+            self.forget_window_geometry(&window);
             if self
                 .dragged_window
                 .as_ref()
@@ -475,3 +706,4 @@ impl XdgShellHandler for State {
 }
 
 delegate_xdg_shell!(State);
+mod geometry;

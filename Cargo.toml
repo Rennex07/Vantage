@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 image = { version = "0.25", default-features = false, features = ["png"] }
+serde_json = "1"
 signal-hook = "0.3"
 tempfile = "3"
 smithay = { version = "0.7.0", default-features = false, features = [

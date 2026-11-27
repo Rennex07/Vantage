@@ -13,6 +13,7 @@ use smithay::{
 };
 
 use crate::{
+    frame_metrics::FrameMetrics,
     session::{Scene, Server},
     shell::{dock::FRAME_INTERVAL, launch},
     wayland::State,
@@ -45,12 +46,16 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         WinitEvent::Focus(focused) => state.host_focus(focused),
         WinitEvent::Input(event) => state.input(
             event,
-            |app, started| launch::open(app, started, &client_socket, &app_exits),
+            (
+                |app, started| launch::open(app, started, &client_socket, &app_exits, None),
+                |tool: crate::desktop::Tool| tool.open(&client_socket),
+            ),
             None,
         ),
     })?;
 
     println!("WAYLAND_DISPLAY={}", server.socket.to_string_lossy());
+    let mut metrics = FrameMetrics::new("nested");
     let mut next_frame: Option<Instant> = None;
     while !state.closed {
         let now = Instant::now();
@@ -66,6 +71,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                 state.status_hits = None;
                 next_frame = None;
             } else {
+                let start = metrics.start();
                 let scale = backend.window().scale_factor();
                 {
                     let (renderer, mut target) = backend.bind()?;
@@ -78,8 +84,10 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                         scale,
                     )?;
                 }
+                let submit_start = metrics.start();
                 backend.submit(Some(&[Rectangle::from_size(size)]))?;
-                state.frame_presented(Instant::now());
+                metrics.submitted(start, submit_start);
+                state.frame_presented(Instant::now(), false);
                 next_frame = scene.is_animating(&state).then_some(now + FRAME_INTERVAL);
             }
         }

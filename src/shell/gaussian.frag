@@ -22,11 +22,12 @@ vec3 pair(float distance) {
 void main() {
     vec3 color;
     if (direction.x == 0.0 && direction.y == 0.0) {
-        // Prefilter the full-size scene before dropping to quarter resolution.
-        color = 0.25 * (texture2D(tex, v_coords + texel).rgb
-                      + texture2D(tex, v_coords - texel).rgb
-                      + texture2D(tex, v_coords + vec2(texel.x, -texel.y)).rgb
-                      + texture2D(tex, v_coords + vec2(-texel.x, texel.y)).rgb);
+        // Take four samples across the larger downsampling footprint.
+        vec2 offset = 2.0 * texel;
+        color = 0.25 * (texture2D(tex, v_coords + offset).rgb
+                      + texture2D(tex, v_coords - offset).rgb
+                      + texture2D(tex, v_coords + vec2(offset.x, -offset.y)).rgb
+                      + texture2D(tex, v_coords + vec2(-offset.x, offset.y)).rgb);
     } else {
         // A 17-tap Gaussian, with adjacent taps combined by linear filtering.
         color = texture2D(tex, v_coords).rgb * 0.103153;

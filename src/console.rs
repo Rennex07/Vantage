@@ -6,18 +6,28 @@ use vte4::{
     prelude::*,
 };
 
-const SHELL_FALLBACK: &str = "/bin/sh";
+use crate::{
+    palette::{Mode, Theme, hex},
+    preferences,
+};
 
-pub fn run() -> glib::ExitCode {
+const SHELL_FALLBACK: &str = "/bin/sh";
+const NETWORK_COLORS: &str = "NEWT_COLORS=+root=white,black:border=gray,blue:window=white,blue:shadow=white,black:+title=brightcyan,blue:button=white,cyan:actbutton=white,magenta:+checkbox=white,cyan:actcheckbox=white,magenta:entry=white,black:+label=lightgray,blue:listbox=white,blue:actlistbox=white,magenta:+textbox=white,blue:acttextbox=white,magenta:emptyscale=gray,blue:+disentry=gray,blue:compactbutton=white,blue:actsellistbox=white,magenta:+sellistbox=brightcyan,blue";
+
+pub fn run(network: bool) -> glib::ExitCode {
     let app = gtk::Application::builder()
-        .application_id("org.vantage.Console")
+        .application_id(if network {
+            "org.vantage.Network"
+        } else {
+            "org.vantage.Console"
+        })
         .flags(gio::ApplicationFlags::NON_UNIQUE)
         .build();
-    app.connect_activate(open_console);
+    app.connect_activate(move |app| open_console(app, network));
     app.run_with_args(&["vantage-console"])
 }
 
-fn open_console(app: &gtk::Application) {
+fn open_console(app: &gtk::Application, network: bool) {
     let terminal = Terminal::new();
     terminal.set_font(Some(&pango::FontDescription::from_string(
         "JetBrains Mono 11",
@@ -26,12 +36,6 @@ fn open_console(app: &gtk::Application) {
     terminal.set_scrollback_lines(10_000);
     terminal.set_scroll_on_keystroke(true);
     terminal.set_mouse_autohide(true);
-    let ink = gdk::RGBA::new(238.0 / 255.0, 244.0 / 255.0, 1.0, 1.0);
-    let navy = gdk::RGBA::new(13.0 / 255.0, 22.0 / 255.0, 41.0 / 255.0, 1.0);
-    let blue = gdk::RGBA::new(145.0 / 255.0, 191.0 / 255.0, 250.0 / 255.0, 1.0);
-    terminal.set_color_foreground(&ink);
-    terminal.set_color_background(&navy);
-    terminal.set_color_cursor(Some(&blue));
     terminal.set_margin_top(8);
     terminal.set_margin_bottom(8);
     terminal.set_margin_start(12);
@@ -42,43 +46,29 @@ fn open_console(app: &gtk::Application) {
         .vscrollbar_policy(gtk::PolicyType::Automatic)
         .child(&terminal)
         .build();
-    let title = gtk::Label::new(Some("Console"));
+    let name = if network {
+        "Network & Wi-Fi"
+    } else {
+        "Console"
+    };
+    let title = gtk::Label::new(Some(name));
     title.add_css_class("console-title");
-    let mark = gtk::Label::new(Some("›_"));
+    let mark = gtk::Label::new(Some(if network { "⌁" } else { "›_" }));
     mark.add_css_class("console-mark");
     let header = gtk::HeaderBar::builder()
         .title_widget(&title)
-        .decoration_layout(":close")
+        .decoration_layout(":minimize,maximize,close")
         .build();
     header.pack_start(&mark);
     let window = gtk::ApplicationWindow::builder()
         .application(app)
-        .title("Console")
+        .title(name)
         .titlebar(&header)
         .default_width(760)
         .default_height(420)
         .child(&scroller)
         .build();
-    let style = gtk::CssProvider::new();
-    style.load_from_string(
-        "window { background: #0d1629; color: #eef4ff; }
-         scrolledwindow { background: #0d1629; }
-         headerbar { min-height: 42px; padding: 0 8px;
-                     background: linear-gradient(#233556, #1b2c4d); color: #eef4ff;
-                     border-bottom: 1px solid #375579; box-shadow: none; }
-         .console-title { font-weight: 700; }
-         .console-mark { font-family: monospace; font-weight: bold; font-size: 14px;
-                         color: #d9eaff; background: #304d77; border-radius: 8px;
-                         min-width: 26px; margin: 7px 4px; }
-         headerbar button { color: #eef4ff; }
-         headerbar button:hover { background: #3a5171; }
-         scrollbar slider { background: #526e97; min-width: 5px; }",
-    );
-    gtk::style_context_add_provider_for_display(
-        &WidgetExt::display(&window),
-        &style,
-        gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
-    );
+    follow_appearance(&terminal, &window, network);
 
     bind_clipboard_keys(&terminal);
 
@@ -89,7 +79,93 @@ fn open_console(app: &gtk::Application) {
         }
     });
     // Present the window once VTE has a PTY and can accept input.
-    start_login_shell(&terminal, &window);
+    if network {
+        spawn(
+            &terminal,
+            &window,
+            &["nmtui"],
+            &[NETWORK_COLORS],
+            glib::SpawnFlags::SEARCH_PATH,
+            false,
+            "Could not start NetworkManager settings. Install network-manager.",
+        );
+    } else {
+        start_login_shell(&terminal, &window);
+    }
+}
+
+fn follow_appearance(terminal: &Terminal, window: &gtk::ApplicationWindow, network: bool) {
+    let style = gtk::CssProvider::new();
+    let display = WidgetExt::display(window);
+    let mut current = preferences::appearance().theme;
+    apply_theme(terminal, &style, current, network);
+    gtk::style_context_add_provider_for_display(
+        &display,
+        &style,
+        gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+    );
+    let terminal = terminal.downgrade();
+    glib::timeout_add_local(std::time::Duration::from_millis(150), move || {
+        let Some(terminal) = terminal.upgrade() else {
+            gtk::style_context_remove_provider_for_display(&display, &style);
+            return glib::ControlFlow::Break;
+        };
+        let next = preferences::appearance().theme;
+        if next != current {
+            current = next;
+            apply_theme(&terminal, &style, current, network);
+        }
+        glib::ControlFlow::Continue
+    });
+}
+
+fn apply_theme(terminal: &Terminal, style: &gtk::CssProvider, theme: Theme, network: bool) {
+    let colors = theme.colors();
+    let [base, surface, raised, selected, text, accent, muted] = [
+        colors.base,
+        colors.surface,
+        colors.raised,
+        colors.selected,
+        colors.text,
+        colors.accent,
+        colors.muted,
+    ]
+    .map(hex);
+    let rgba = |color: &str| gdk::RGBA::parse(color).expect("valid terminal color");
+    let palette = match (network, theme.mode) {
+        (true, _) => [
+            "#0d1629", "#ab515c", "#488065", "#a47a55", "#1b2c4d", "#395579", "#293f5d", "#b4c6df",
+            "#6981a6", "#ff9da4", "#86cda9", "#ecb77c", "#669cec", "#ba9ce0", "#91bffa", "#eef4ff",
+        ],
+        (false, Mode::Dark) => [
+            "#141922", "#e77f88", "#87ca9d", "#e5b77c", "#8ab3fd", "#cfa1dd", "#8ed3db", "#dae0e8",
+            "#788397", "#ff9ba5", "#a9e4b3", "#f7d09b", "#abc9ff", "#e4b6ee", "#a9e5eb", "#eff3f8",
+        ],
+        (false, Mode::Light) => [
+            "#18212d", "#9e3045", "#2f6747", "#81521c", "#1c56a4", "#793580", "#286469", "#d6dbe1",
+            "#536173", "#98243c", "#286546", "#714b15", "#164b93", "#76327d", "#245b68", "#f5f5f7",
+        ],
+    }
+    .map(rgba);
+    terminal.set_colors(
+        Some(&rgba(if network { "#eef4ff" } else { &text })),
+        Some(&rgba(if network { "#0d1629" } else { &base })),
+        &palette.each_ref(),
+    );
+    terminal.set_color_cursor(Some(&rgba(&accent)));
+    style.load_from_string(&format!(
+        "window, scrolledwindow {{ background: {base}; color: {text}; }}
+         headerbar {{ min-height: 42px; padding: 0 8px; font-family: Roboto, sans-serif;
+                      background: linear-gradient({raised}, {surface}); color: {text};
+                      border-bottom: 1px solid {selected}; box-shadow: none; }}
+         .console-title {{ font-weight: 900; }}
+         .console-mark {{ font-family: monospace; font-weight: bold; font-size: 14px;
+                          color: {text}; background: {selected}; border-radius: 8px;
+                          min-width: 26px; margin: 7px 4px; }}
+         headerbar button {{ color: {text}; }}
+         headerbar button:hover {{ background: {selected}; }}
+         scrollbar slider {{ background: {muted}; min-width: 5px; }}"
+    ));
 }
 
 fn bind_clipboard_keys(terminal: &Terminal) {
@@ -134,15 +210,35 @@ fn spawn_shell(terminal: &Terminal, window: &gtk::ApplicationWindow, shell: &str
         .and_then(|name| name.to_str())
         .unwrap_or("sh");
     let login_name = format!("-{name}");
+    spawn(
+        terminal,
+        window,
+        &[shell, &login_name],
+        &[],
+        glib::SpawnFlags::FILE_AND_ARGV_ZERO,
+        can_fallback,
+        "Could not start the login shell.",
+    );
+}
+
+fn spawn(
+    terminal: &Terminal,
+    window: &gtk::ApplicationWindow,
+    command: &[&str],
+    environment: &[&str],
+    flags: glib::SpawnFlags,
+    can_fallback: bool,
+    error_message: &'static str,
+) {
     let home = glib::home_dir();
     let view = terminal.downgrade();
     let window = window.downgrade();
     terminal.spawn_async(
         PtyFlags::DEFAULT,
         home.to_str().filter(|path| Path::new(path).is_dir()),
-        &[shell, &login_name],
-        &[],
-        glib::SpawnFlags::FILE_AND_ARGV_ZERO,
+        command,
+        environment,
+        flags,
         || {},
         -1,
         gio::Cancellable::NONE,
@@ -156,8 +252,7 @@ fn spawn_shell(terminal: &Terminal, window: &gtk::ApplicationWindow, shell: &str
                     return;
                 }
                 terminal.set_input_enabled(false);
-                terminal
-                    .feed(format!("Could not start the login shell.\r\n{error}\r\n").as_bytes());
+                terminal.feed(format!("{error_message}\r\n{error}\r\n").as_bytes());
             }
             GtkWindowExt::set_focus(&window, Some(&terminal));
             window.present();

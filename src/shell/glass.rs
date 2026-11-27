@@ -13,7 +13,11 @@ use smithay::{
     utils::{Physical, Rectangle, Size, Transform},
 };
 
-use crate::{wallpaper, wayland::WindowScene};
+use crate::{
+    palette::{Mode, Theme},
+    wallpaper,
+    wayland::WindowScene,
+};
 
 // FBO pixels are sampled as a top-down texture by subsequent Smithay passes.
 const SURFACE_TRANSFORM: Transform = Transform::Normal;
@@ -22,6 +26,12 @@ pub struct FrostedWindow {
     pub behind: usize,
     pub bounds: Rectangle<i32, Physical>,
     pub opacity: f32,
+    pub theme: Theme,
+}
+
+pub struct GlassStyle {
+    pub overview: f32,
+    pub full_effects: bool,
 }
 
 pub struct Glass {
@@ -34,6 +44,7 @@ struct Buffers {
     scene: GlesTexture,
     horizontal: GlesTexture,
     blurred: GlesTexture,
+    downsample: i32,
 }
 
 impl Glass {
@@ -52,6 +63,8 @@ impl Glass {
                     UniformName::new("panel_origin", UniformType::_2f),
                     UniformName::new("output_size", UniformType::_2f),
                     UniformName::new("panel_size", UniformType::_2f),
+                    UniformName::new("surface_color", UniformType::_3f),
+                    UniformName::new("daylight", UniformType::_1f),
                 ],
             )?,
             textures: None,
@@ -64,16 +77,25 @@ impl Glass {
         wallpaper: &GlesTexture,
         size: Size<i32, Physical>,
         windows: &WindowScene,
+        style: GlassStyle,
     ) -> Result<&GlesTexture, GlesError> {
+        let downsample = if style.full_effects { 4 } else { 8 };
         if !self.textures.as_ref().is_some_and(|buffers| {
-            buffers.scene.size().w == size.w && buffers.scene.size().h == size.h
+            buffers.scene.size().w == size.w
+                && buffers.scene.size().h == size.h
+                && buffers.downsample == downsample
         }) {
             let full = (size.w, size.h).into();
-            let reduced = ((size.w + 3) / 4, (size.h + 3) / 4).into();
+            let reduced = (
+                (size.w + downsample - 1) / downsample,
+                (size.h + downsample - 1) / downsample,
+            )
+                .into();
             self.textures = Some(Buffers {
                 scene: renderer.create_buffer(Fourcc::Abgr8888, full)?,
                 horizontal: renderer.create_buffer(Fourcc::Abgr8888, reduced)?,
                 blurred: renderer.create_buffer(Fourcc::Abgr8888, reduced)?,
+                downsample,
             });
         }
         let buffers = self.textures.as_mut().expect("glass textures allocated");
@@ -81,7 +103,8 @@ impl Glass {
         let mut scene = renderer.bind(&mut buffers.scene)?;
         {
             let mut frame = renderer.render(&mut scene, size, SURFACE_TRANSFORM)?;
-            wallpaper::draw(&mut frame, wallpaper, bounds)?;
+            wallpaper::draw(&mut frame, wallpaper, bounds, 1.0)?;
+            crate::session::dim_wallpaper(&mut frame, bounds, style.overview)?;
             let _ = frame.finish()?;
         }
 
@@ -131,6 +154,8 @@ impl Glass {
             let mut frame = renderer.render(&mut scene, size, SURFACE_TRANSFORM)?;
             let x = f64::from(panel.bounds.loc.x) / f64::from(size.w);
             let y = f64::from(panel.bounds.loc.y) / f64::from(size.h);
+            let (r, g, b) = panel.theme.colors().surface;
+            let daylight = f32::from(panel.theme.mode == Mode::Light);
             let source = Rectangle::new(
                 (x * f64::from(low_size.w), y * f64::from(low_size.h)).into(),
                 (
@@ -151,6 +176,8 @@ impl Glass {
                 &[
                     Uniform::new("panel_origin", (x as f32, y as f32)),
                     Uniform::new("output_size", (size.w as f32, size.h as f32)),
+                    Uniform::new("surface_color", (r as f32, g as f32, b as f32)),
+                    Uniform::new("daylight", daylight),
                     Uniform::new(
                         "panel_size",
                         (panel.bounds.size.w as f32, panel.bounds.size.h as f32),

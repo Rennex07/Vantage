@@ -1,12 +1,12 @@
 use std::time::{Duration, Instant};
 
 use smithay::{
-    delegate_compositor, delegate_output, delegate_shm,
+    delegate_compositor, delegate_output, delegate_shm, delegate_viewporter,
     desktop::{PopupManager, Space, Window},
     input::{
         SeatState,
         keyboard::{KeyboardHandle, XkbConfig},
-        pointer::PointerHandle,
+        pointer::{CursorImageStatus, PointerHandle},
     },
     output::{Mode, Output, PhysicalProperties, Scale, Subpixel},
     reexports::wayland_server::{
@@ -22,20 +22,26 @@ use smithay::{
         selection::data_device::DataDeviceState,
         shell::xdg::XdgShellState,
         shm::{ShmHandler, ShmState},
+        viewporter::ViewporterState,
     },
 };
 
-use crate::shell::{
-    dock::{DockAction, DockHits},
-    launch::{App, Exit},
-    motion::{LAUNCH_TIMEOUT, Launch, Opening},
-    status::{self, Status},
-    workspaces::{WORKSPACE_COUNT, Workspaces},
+use crate::{
+    preferences::Appearance,
+    shell::{
+        dock::{Action as DockAction, DockHits},
+        launch::{self, App, Exit, Target},
+        motion::{LAUNCH_TIMEOUT, Launch, Opening},
+        status::{self, Action, Panel, Status},
+        workspaces::{WORKSPACE_COUNT, Workspaces},
+    },
 };
 
 mod clipboard;
 mod dmabuf;
 mod input;
+mod lock;
+pub(crate) mod overview;
 mod windows;
 
 pub use input::Shortcut;
@@ -44,6 +50,7 @@ pub use windows::WindowScene;
 #[derive(Default)]
 pub struct ClientState {
     compositor: CompositorClientState,
+    locker: bool,
 }
 
 impl ClientData for ClientState {}
@@ -58,9 +65,18 @@ pub struct State {
     spaces: [Space<Window>; WORKSPACE_COUNT],
     opening_windows: Vec<(Window, Opening)>,
     dragged_window: Option<windows::WindowDrag>,
+    resizing_window: Option<Window>,
+    overview: overview::Overview,
+    switching_windows: bool,
+    minimized_windows: Vec<Window>,
     pending_launches: [Option<Launch>; App::ALL.len()],
-    pub notice: Option<(App, &'static str, Instant)>,
-    pub status_open: bool,
+    pub notice: Option<(String, &'static str, Instant)>,
+    pub status_panel: Panel,
+    pub status_hovered: Option<Action>,
+    status_pressed: Option<Action>,
+    pub status_error: Option<&'static str>,
+    pub native_session: bool,
+    lock: lock::Lock,
     pub status_hits: Option<(Rectangle<i32, Physical>, Rectangle<i32, Physical>)>,
     host_focused: bool,
     pub workspaces: Workspaces,
@@ -69,14 +85,17 @@ pub struct State {
     seat_state: SeatState<Self>,
     keyboard: KeyboardHandle<Self>,
     pointer: PointerHandle<Self>,
-    started: Instant,
+    cursor: CursorImageStatus,
     intercepted_keys: std::collections::HashSet<u32>,
     pub redraw: bool,
     pub closed: bool,
     pub pending_clients: bool,
     pub dock_hits: Option<DockHits>,
     pub dock_pressed: Option<DockAction>,
+    pub dock_pins: Vec<crate::preferences::DockPin>,
     pub status: Status,
+    pub display_brightness: u8,
+    pub appearance: Appearance,
 }
 
 impl State {
@@ -123,13 +142,23 @@ impl State {
         let mut seat = seat_state.new_wl_seat(display, "Vantage");
         let keyboard = seat.add_keyboard(XkbConfig::default(), 250, 30)?;
         let pointer = seat.add_pointer();
+        ViewporterState::new::<Self>(display);
         let mut state = Self {
             spaces,
             opening_windows: Vec::new(),
             dragged_window: None,
+            resizing_window: None,
+            overview: overview::Overview::default(),
+            switching_windows: false,
+            minimized_windows: Vec::new(),
             pending_launches: [None; App::ALL.len()],
             notice: None,
-            status_open: false,
+            status_panel: Panel::Closed,
+            status_hovered: None,
+            status_pressed: None,
+            status_error: None,
+            native_session: false,
+            lock: lock::Lock::new(display),
             status_hits: None,
             host_focused: true,
             workspaces: Workspaces::default(),
@@ -138,7 +167,7 @@ impl State {
             seat_state,
             keyboard,
             pointer,
-            started: Instant::now(),
+            cursor: CursorImageStatus::default_named(),
             intercepted_keys: Default::default(),
             compositor: CompositorState::new::<Self>(display),
             shm: ShmState::new::<Self>(display, Vec::new()),
@@ -148,7 +177,10 @@ impl State {
             pending_clients: false,
             dock_hits: None,
             dock_pressed: None,
+            dock_pins: crate::preferences::dock_pins(),
             status: Status::read(),
+            display_brightness: crate::preferences::brightness(),
+            appearance: crate::preferences::appearance(),
             display: display.clone(),
             data_device: DataDeviceState::new::<Self>(display),
             output,
@@ -157,8 +189,8 @@ impl State {
         Ok(state)
     }
 
-    fn start_app(&mut self, app: App, open: impl FnOnce(App, Instant) -> std::io::Result<()>) {
-        if self.pending_launches[app.index()].is_some() {
+    fn start_app(&mut self, app: App, open: impl FnOnce(Target, Instant) -> std::io::Result<()>) {
+        if self.restore_dock_window(app) || self.pending_launches[app.index()].is_some() {
             return;
         }
         let Some(dock) = &self.dock_hits else {
@@ -167,30 +199,50 @@ impl State {
         let launch = Launch {
             app,
             started: Instant::now(),
-            anchor: dock.anchor(app),
+            anchor: dock.anchor(app.index()),
             workspace: self.workspaces.active,
         };
         self.notice = None;
-        match open(app, launch.started) {
+        match open(Target::BuiltIn(app), launch.started) {
             Ok(()) => self.pending_launches[app.index()] = Some(launch),
             Err(error) => {
                 eprintln!("Could not open {}: {error}", app.name());
-                self.show_notice(app, "The app could not be started.");
+                self.show_notice(app.name().into(), "The app could not be started.");
             }
         }
         self.redraw = true;
     }
 
-    fn show_notice(&mut self, app: App, message: &'static str) {
-        self.notice = Some((app, message, Instant::now() + Duration::from_secs(5)));
+    fn start_pinned(
+        &mut self,
+        id: String,
+        open: impl FnOnce(Target, Instant) -> std::io::Result<()>,
+    ) {
+        self.notice = None;
+        if !self.focus_pinned_window(&id)
+            && let Err(error) = open(Target::Desktop(id.clone()), Instant::now())
+        {
+            eprintln!("Could not open {id}: {error}");
+            self.show_notice(launch::desktop_name(&id), "The app could not be started.");
+        }
+        self.redraw = true;
+    }
+
+    fn show_notice(&mut self, name: String, message: &'static str) {
+        self.notice = Some((name, message, Instant::now() + Duration::from_secs(5)));
         self.redraw = true;
     }
 
     pub fn launch_exited(&mut self, exit: Exit) {
-        let pending = &mut self.pending_launches[exit.app.index()];
-        if pending.is_some_and(|launch| launch.started == exit.started) {
-            *pending = None;
-            self.show_notice(exit.app, exit.message);
+        match exit.target {
+            Target::BuiltIn(app) => {
+                let pending = &mut self.pending_launches[app.index()];
+                if pending.is_some_and(|launch| launch.started == exit.started) {
+                    *pending = None;
+                    self.show_notice(app.name().into(), exit.message);
+                }
+            }
+            Target::Desktop(id) => self.show_notice(launch::desktop_name(&id), exit.message),
         }
     }
 
@@ -199,18 +251,24 @@ impl State {
             let pending = &mut self.pending_launches[app.index()];
             if pending.is_some_and(|launch| now >= launch.started + LAUNCH_TIMEOUT) {
                 *pending = None;
-                self.show_notice(app, "No window appeared. Click the dock icon to retry.");
+                self.show_notice(
+                    app.name().into(),
+                    "No window appeared. Click the dock icon to retry.",
+                );
             }
         }
     }
 
     pub fn shell_is_animating(&self) -> bool {
-        self.pending_launches.iter().any(Option::is_some)
+        !self.appearance.reduce_motion && self.pending_launches.iter().any(Option::is_some)
     }
 
     pub fn dock_launch_intensity(&self, now: Instant) -> (f32, f32) {
         let strength = |app: App| {
             self.pending_launches[app.index()].map_or(0.0, |launch| {
+                if self.appearance.reduce_motion {
+                    return 0.8;
+                }
                 let elapsed = now.saturating_duration_since(launch.started).as_secs_f32();
                 0.65 + 0.35 * (elapsed * 9.0).cos()
             })
@@ -225,26 +283,56 @@ impl State {
         self.pending_launches
             .iter()
             .flatten()
-            .filter(|launch| launch.workspace == self.workspaces.active)
+            .filter(|launch| {
+                !self.appearance.reduce_motion && launch.workspace == self.workspaces.active
+            })
             .map(move |launch| (launch.app, launch.tile(now), 1.0))
     }
 
     fn status_at(&self, point: Point<f64, Logical>) -> bool {
         self.status_hits.is_some_and(|(bar, panel)| {
             bar.to_f64().to_logical(1.0).contains(point)
-                || (self.status_open && panel.to_f64().to_logical(1.0).contains(point))
+                || (self.status_panel.open() && panel.to_f64().to_logical(1.0).contains(point))
         })
     }
 
-    fn status_toggle_at(&self, point: Point<f64, Logical>) -> bool {
+    fn status_action_at(&self, point: Point<f64, Logical>) -> Option<Action> {
         self.status_hits
-            .is_some_and(|(bar, _)| status::toggle_contains(bar, point))
+            .and_then(|hits| status::action_at(hits, point, self.status_panel, self.native_session))
+    }
+
+    pub fn refresh_preferences(&mut self) {
+        self.check_locker();
+        let pins = crate::preferences::dock_pins();
+        if self.dock_pins != pins {
+            self.dock_pins = pins;
+            self.dock_hits = None;
+            self.dock_pressed = None;
+            self.redraw = true;
+        }
+        let appearance = crate::preferences::appearance();
+        if self.appearance != appearance {
+            self.appearance = appearance;
+            if appearance.reduce_motion {
+                self.workspaces.settle();
+                self.overview.settle();
+                self.opening_windows.clear();
+            }
+            self.redraw = true;
+        }
+        self.finish_shell_frame(Instant::now());
+        let brightness = crate::preferences::brightness();
+        if self.display_brightness != brightness {
+            self.display_brightness = brightness;
+            self.redraw = true;
+        }
     }
 
     pub fn refresh_status(&mut self) {
         if self
             .notice
-            .is_some_and(|(_, _, until)| Instant::now() >= until)
+            .as_ref()
+            .is_some_and(|(_, _, until)| Instant::now() >= *until)
         {
             self.notice = None;
             self.redraw = true;
@@ -278,6 +366,7 @@ impl State {
             self.output.delete_mode(previous);
         }
         self.center_windows();
+        self.configure_locker();
     }
 }
 
@@ -301,6 +390,9 @@ impl CompositorHandler for State {
 
     fn commit(&mut self, surface: &WlSurface) {
         smithay::backend::renderer::utils::on_commit_buffer_handler::<Self>(surface);
+        if self.lock_surface() == Some(surface) {
+            self.update_lock_focus();
+        }
         self.surface_committed(surface);
     }
 }
@@ -320,3 +412,4 @@ impl OutputHandler for State {}
 delegate_compositor!(State);
 delegate_output!(State);
 delegate_shm!(State);
+delegate_viewporter!(State);

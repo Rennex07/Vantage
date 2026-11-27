@@ -31,6 +31,7 @@ use smithay::{
 };
 
 use crate::{
+    frame_metrics::FrameMetrics,
     session::{Scene, Server},
     shell::launch,
     wayland::{Shortcut, State},
@@ -77,20 +78,38 @@ pub fn run() -> Result<()> {
         kms.mode.into(),
     )?;
     state.advertise_dmabuf(&kms.renderer);
+    state.native_session = true;
+    let x11 = match crate::desktop::x11::X11::start(&server.socket) {
+        Ok(x11) => Some(x11),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => {
+            eprintln!("Could not start Xwayland: {error}");
+            None
+        }
+    };
+    let _services = crate::desktop::Services::start(&server.socket, x11.as_ref());
     let mut native = Native {
         kms,
         state,
         session,
         input: input.clone(),
+        metrics: FrameMetrics::new("native DRM"),
         pending_flip: false,
+        pending_lock_frame: false,
+        x11,
         error: None,
     };
     handle.insert_source(drm_events, |event, _, native| match event {
         DrmEvent::VBlank(crtc) if crtc == native.kms.scanout.crtc() && native.pending_flip => {
             native.pending_flip = false;
             match native.kms.scanout.frame_submitted() {
-                Ok(Some(())) => native.state.frame_presented(Instant::now()),
-                Ok(None) => (),
+                Ok(Some(())) => {
+                    native
+                        .state
+                        .frame_presented(Instant::now(), native.pending_lock_frame);
+                    native.metrics.presented();
+                }
+                Ok(None) => native.metrics.cancel_pending(),
                 Err(error) => native.error = Some(error.into()),
             }
         }
@@ -108,16 +127,18 @@ pub fn run() -> Result<()> {
         if !native.session.is_active() {
             return;
         }
-        let (mut exit, mut vt) = (false, None);
+        let mut vt = None;
+        let x11 = native.x11.as_ref();
         native.state.input(
             event,
-            |app, started| launch::open(app, started, &socket, &app_exits),
+            (
+                |app, started| launch::open(app, started, &socket, &app_exits, x11),
+                |tool: crate::desktop::Tool| tool.open_with_x11(&socket, x11),
+            ),
             Some(&mut |shortcut| match shortcut {
-                Shortcut::Exit => exit = true,
                 Shortcut::SwitchVt(number) => vt = Some(number),
             }),
         );
-        native.state.closed |= exit;
         if let Some(vt) = vt
             && let Err(error) = native.session.change_vt(vt)
         {
@@ -157,7 +178,8 @@ pub fn run() -> Result<()> {
             && (native.state.redraw || native.kms.scene.is_animating(&native.state))
         {
             native.state.redraw = false;
-            native.kms.draw(&mut native.state)?;
+            native.pending_lock_frame = native.state.lock_active();
+            native.kms.draw(&mut native.state, &mut native.metrics)?;
             native.pending_flip = true;
         }
         // Page flips pace animation and coalesce bursts of client or input activity.
@@ -171,7 +193,10 @@ struct Native {
     state: State,
     session: LibSeatSession,
     input: Libinput,
+    metrics: FrameMetrics,
     pending_flip: bool,
+    pending_lock_frame: bool,
+    x11: Option<crate::desktop::x11::X11>,
     error: Option<Box<dyn Error>>,
 }
 
@@ -195,6 +220,7 @@ impl Native {
                 if self.pending_flip {
                     self.kms.scanout.frame_submitted()?;
                     self.pending_flip = false;
+                    self.metrics.cancel_pending();
                 }
                 self.kms.scanout.reset_buffers();
                 self.input
@@ -302,7 +328,8 @@ impl Kms {
         }
     }
 
-    fn draw(&mut self, state: &mut State) -> Result<()> {
+    fn draw(&mut self, state: &mut State, metrics: &mut FrameMetrics) -> Result<()> {
+        let start = metrics.start();
         let (mut buffer, _) = self.scanout.next_buffer()?;
         let mut target = self.renderer.bind(&mut buffer)?;
         let sync = self.scene.draw(
@@ -313,7 +340,9 @@ impl Kms {
             Transform::Normal,
             1.0,
         )?;
+        let submit_start = metrics.start();
         self.scanout.queue_buffer(Some(sync), None, ())?;
+        metrics.submitted(start, submit_start);
         Ok(())
     }
 }

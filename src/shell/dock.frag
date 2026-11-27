@@ -11,17 +11,15 @@ precision highp float;
 uniform float alpha;
 uniform vec2 wallpaper_origin;
 uniform vec2 wallpaper_step;
+uniform float panel_width;
+uniform vec3 surface_color;
+uniform vec3 glass_tint;
 uniform float hovered;
 uniform float pressed;
 uniform vec2 launching;
-uniform float workspace_position;
+uniform float solid;
+uniform float reduce_motion;
 varying vec2 v_coords;
-
-const vec3 ink = vec3(0.051, 0.086, 0.161);
-const vec3 glass = vec3(0.106, 0.173, 0.302);
-const vec3 blue = vec3(0.569, 0.749, 0.980);
-const vec3 amber = vec3(0.925, 0.718, 0.486);
-const vec3 paper = vec3(0.933, 0.957, 1.0);
 
 float box(vec2 point, vec2 half_size, float radius) {
     vec2 corner = abs(point) - half_size + vec2(radius);
@@ -38,7 +36,8 @@ float segment(vec2 point, vec2 from, vec2 to) {
 }
 
 vec3 blur_wallpaper(vec2 center) {
-    vec2 d = 12.0 * wallpaper_step;
+    vec2 d = 16.0 * wallpaper_step;
+    vec2 farther = 29.0 * wallpaper_step;
     vec3 sum = texture2D(tex, center).rgb * 4.0;
     sum += texture2D(tex, center + vec2(d.x, 0.0)).rgb * 2.0;
     sum += texture2D(tex, center - vec2(d.x, 0.0)).rgb * 2.0;
@@ -48,82 +47,90 @@ vec3 blur_wallpaper(vec2 center) {
     sum += texture2D(tex, center - d).rgb;
     sum += texture2D(tex, center + vec2(d.x, -d.y)).rgb;
     sum += texture2D(tex, center + vec2(-d.x, d.y)).rgb;
-    return sum / 16.0;
+    sum += texture2D(tex, center + vec2(farther.x, 0.0)).rgb;
+    sum += texture2D(tex, center - vec2(farther.x, 0.0)).rgb;
+    sum += texture2D(tex, center + vec2(0.0, farther.y)).rgb;
+    sum += texture2D(tex, center - vec2(0.0, farther.y)).rgb;
+    return sum / 20.0;
 }
 
-float digit(vec2 p, float slot) {
-    float top = segment(p, vec2(-3.3, -5.0), vec2(2.9, -5.0));
-    float middle = segment(p, vec2(-3.3, 0.0), vec2(2.9, 0.0));
-    float bottom = segment(p, vec2(-3.3, 5.0), vec2(2.9, 5.0));
-    float right = segment(p, vec2(2.9, -5.0), vec2(2.9, 0.0));
-    if (slot < 0.5) {
-        float stem = segment(p, vec2(0.4, -5.0), vec2(0.4, 5.0));
-        float cap = segment(p, vec2(-2.8, -2.8), vec2(0.4, -5.0));
-        return min(min(stem, cap), bottom);
-    }
-    float lower = slot < 1.5
-        ? segment(p, vec2(-3.3, 0.0), vec2(-3.3, 5.0))
-        : segment(p, vec2(2.9, 0.0), vec2(2.9, 5.0));
-    return min(min(top, middle), min(bottom, min(right, lower)));
+vec4 over(vec4 backdrop, vec3 color, float coverage) {
+    return vec4(color * coverage, coverage) + backdrop * (1.0 - coverage);
 }
 
-vec3 app_tile(vec3 color, vec2 point, float index) {
+vec4 app_icon(vec4 color, vec2 point, float index) {
     float hover = 1.0 - step(0.5, abs(hovered - index));
     float down = 1.0 - step(0.5, abs(pressed - index));
-    float busy = index < 0.5 ? launching.x : launching.y;
-    vec3 accent = index < 0.5 ? blue : amber;
-    vec2 p = point - vec2(42.0 + index * 62.0, 35.0 - 2.0 * hover + 2.0 * down);
-    p /= 1.0 - 0.10 * down - 0.12 * busy;
-    float tile = box(p, vec2(25.0, 24.0), 14.0);
-    vec3 fill = mix(glass, accent, 0.13 + 0.16 * hover + 0.18 * busy);
-    color = mix(color, mix(fill, ink, clamp((p.y + 24.0) / 72.0, 0.0, 0.70)), aa(tile));
-    color = mix(color, accent, (aa(tile) - aa(tile + 1.0)) * (0.39 + 0.28 * hover));
+    float busy = index < 0.5 ? launching.x : index < 1.5 ? launching.y : 0.0;
+    vec3 accent = index < 0.5 ? vec3(0.15, 0.31, 0.49) : vec3(0.53, 0.30, 0.11);
+    vec2 p = point - vec2(42.0 + index * 62.0, 35.0 + (1.0 - reduce_motion) * (-2.0 * hover + 2.0 * down));
+    p /= 1.0 - (1.0 - reduce_motion) * (0.10 * down + 0.12 * busy);
+    float tile = box(p, vec2(24.0, 22.0), 16.0);
+    color = over(color, vec3(1.0), aa(tile) * (0.30 * hover + 0.13 * busy));
+    color = over(color, accent, aa(tile) * down * 0.20);
+
     if (index < 0.5) {
-        float screen = abs(box(p, vec2(14.0, 10.5), 4.0));
+        float screen = box(p, vec2(14.5, 11.0), 4.5);
         float prompt = min(segment(p, vec2(-8.0, -4.0), vec2(-4.0, 0.0)),
                            segment(p, vec2(-4.0, 0.0), vec2(-8.0, 4.0)));
         float cursor = segment(p, vec2(0.5, 4.0), vec2(7.0, 4.0));
-        color = mix(color, accent, aa(screen - 1.0));
-        color = mix(color, paper, aa(min(prompt, cursor) - 1.1));
-    } else {
-        float tab = box(p - vec2(-5.0, -4.0), vec2(9.0, 7.0), 3.0);
-        float body = box(p - vec2(0.0, 2.0), vec2(14.0, 9.0), 3.0);
-        color = mix(color, amber * 0.72, aa(tab));
-        color = mix(color, mix(amber, vec3(1.0, 0.88, 0.70), 0.30), aa(body));
-        color = mix(color, vec3(0.97, 0.82, 0.61), aa(body + 1.0) - aa(body + 1.6));
+        color = over(color, vec3(0.09, 0.19, 0.31), aa(screen));
+        float screen_rim = aa(screen - 0.55) - aa(screen + 0.65);
+        color = over(color, vec3(0.80, 0.91, 1.0), screen_rim * 0.78);
+        color = over(color, vec3(0.97, 0.99, 1.0), aa(min(prompt, cursor) - 1.05));
+    } else if (index < 1.5) {
+        float tab = box(p - vec2(-5.0, -4.0), vec2(9.5, 7.0), 3.0);
+        float body = box(p - vec2(0.0, 2.0), vec2(14.5, 9.0), 3.5);
+        color = over(color, accent, aa(min(tab, body)));
+        color = over(color, vec3(0.80, 0.56, 0.29), aa(tab + 1.2));
+        vec3 folder = mix(vec3(1.0, 0.84, 0.56), vec3(0.92, 0.65, 0.34),
+                          clamp((p.y + 7.0) / 18.0, 0.0, 1.0));
+        color = over(color, folder, aa(body + 1.2));
+    } else if (42.0 + index * 62.0 > panel_width - 50.0) {
+        float plate = length(p) - 13.0;
+        float rim = aa(plate) - aa(plate + 1.0);
+        color = over(color, vec3(0.09, 0.19, 0.31), aa(plate) * 0.70);
+        color = over(color, vec3(0.84, 0.94, 1.0), rim * 0.75);
+        float cross = min(segment(p, vec2(-5.0, 0.0), vec2(5.0, 0.0)),
+                          segment(p, vec2(0.0, -5.0), vec2(0.0, 5.0)));
+        color = over(color, vec3(1.0), aa(cross - 0.9));
     }
-    float marker = box(point - vec2(42.0 + index * 62.0, 63.0), vec2(4.5, 1.2), 1.0);
-    return mix(color, accent, aa(marker) * max(hover * 0.54, busy));
+    float marker = box(point - vec2(42.0 + index * 62.0, 60.0), vec2(4.5, 1.2), 1.0);
+    return over(color, accent, aa(marker) * max(hover * 0.56, busy));
 }
 
 void main() {
     vec2 point = (v_coords - wallpaper_origin) / wallpaper_step;
-    float panel = box(point - vec2(150.0, 36.0), vec2(147.0, 33.0), 26.0);
-    float opacity = aa(panel);
-    vec3 backdrop = mix(blur_wallpaper(v_coords), ink, 0.74);
-    vec3 color = backdrop + 0.075 * (1.0 - smoothstep(4.0, 64.0, point.y));
-    color = mix(color, blue, (opacity - aa(panel + 1.1)) * 0.36);
+    vec2 local = point - vec2(panel_width * 0.5, 36.0);
 
-    if (point.x < 135.0) {
-        color = app_tile(color, point, step(73.0, point.x));
+    // The capsule normal keeps the thick frost on the top and around its shoulders.
+    float spine = panel_width * 0.5 - 34.0;
+    vec2 radial = local - vec2(clamp(local.x, -spine, spine), 0.0);
+    float distance_from_axis = length(radial);
+    vec2 normal = radial / max(distance_from_axis, 0.01);
+    float panel = distance_from_axis - 30.0;
+    float shape = aa(panel);
+    float depth = max(-panel, 0.0);
+    float upper = smoothstep(0.0, 0.94, -normal.y);
+    vec3 ice = mix(vec3(0.90, 0.94, 1.0), glass_tint, 0.14);
+
+    vec4 dock;
+    if (solid > 0.5) {
+        dock = vec4(surface_color, 1.0);
     } else {
-        float divider = box(point - vec2(138.0, 36.0), vec2(0.6, 15.0), 0.55);
-        color = mix(color, blue, 0.26 * aa(divider));
-        float tray = box(point - vec2(218.0, 36.0), vec2(68.0, 21.0), 18.0);
-        color = mix(color, ink, 0.65 * aa(tray));
-        float slot = clamp(floor((point.x - 155.0) / 42.0), 0.0, 2.0);
-        vec2 number = point - vec2(176.0 + slot * 42.0, 36.0);
-        float hover = 1.0 - step(0.5, abs(hovered - slot - 2.0));
-        float down = 1.0 - step(0.5, abs(pressed - slot - 2.0));
-        float chip = box(number, vec2(17.0, 15.0), 10.0);
-        color = mix(color, blue, (0.14 * hover + 0.22 * down) * aa(chip));
-        vec2 active = point - vec2(176.0 + workspace_position * 42.0, 36.0);
-        float selected = box(active, vec2(17.0, 15.0), 10.0);
-        color = mix(color, mix(glass, blue, 0.34), aa(selected) * 0.96);
-        float dash = box(active - vec2(0.0, 10.0), vec2(3.0, 0.75), 0.7);
-        color = mix(color, blue, aa(dash));
-        color = mix(color, paper, aa(digit(number + vec2(0.0, 1.0), slot) - 0.85));
+        float refraction = exp(-depth / 5.0) * mix(3.5, 13.0, upper);
+        vec2 sample_at = clamp(v_coords - normal * wallpaper_step * refraction, 0.0, 1.0);
+        vec3 material = mix(blur_wallpaper(sample_at), glass_tint, 0.14);
+        float opacity = 0.86;
+        dock = vec4(material * opacity, opacity);
     }
-    float shadow = (1.0 - smoothstep(0.0, 4.0, panel)) * 0.45;
-    gl_FragColor = alpha * vec4(color * opacity, opacity + (1.0 - opacity) * shadow);
+
+    float frosted_edge = upper * (1.0 - smoothstep(0.9, 9.0, depth));
+    dock = over(dock, ice, frosted_edge * 0.62);
+    float outline = aa(panel + 0.25) - aa(panel + 1.45);
+    dock = over(dock, vec3(1.0), outline * mix(0.64, 0.99, upper));
+    dock = app_icon(dock, point, max(0.0, floor((point.x - 11.0) / 62.0)));
+    dock *= shape;
+    float shadow = (1.0 - smoothstep(0.0, 5.0, panel)) * 0.27;
+    gl_FragColor = alpha * vec4(dock.rgb, dock.a + (1.0 - shape) * shadow);
 }

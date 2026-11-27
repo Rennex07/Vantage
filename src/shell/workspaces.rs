@@ -1,38 +1,29 @@
 use std::time::{Duration, Instant};
 
+use super::timeline::{Ease, Transition};
+
 pub const WORKSPACE_COUNT: usize = 3;
 const SWITCH: Duration = Duration::from_millis(300);
 
 #[derive(Default)]
 pub struct Workspaces {
     pub active: usize,
-    slide: Option<Slide>,
-}
-
-struct Slide {
-    from: f64,
-    started: Instant,
+    slide: Option<Transition>,
 }
 
 impl Workspaces {
-    pub fn select(&mut self, index: usize, now: Instant) {
+    pub fn select(&mut self, index: usize, now: Instant, animate: bool) {
         if index >= WORKSPACE_COUNT || index == self.active {
             return;
         }
-        self.slide = Some(Slide {
-            from: self.position(now),
-            started: now,
-        });
+        self.slide = animate
+            .then(|| Transition::new(self.position(now), index as f64, now, SWITCH, Ease::Smooth));
         self.active = index;
     }
 
     pub fn position(&self, now: Instant) -> f64 {
         let target = self.active as f64;
-        self.slide.as_ref().map_or(target, |slide| {
-            let t = progress(now, slide.started, SWITCH);
-            let eased = t * t * (3.0 - 2.0 * t);
-            slide.from + (target - slide.from) * eased
-        })
+        self.slide.as_ref().map_or(target, |slide| slide.value(now))
     }
 
     pub fn is_animating(&self) -> bool {
@@ -40,18 +31,14 @@ impl Workspaces {
     }
 
     pub fn finish_frame(&mut self, now: Instant) {
-        if self
-            .slide
-            .as_ref()
-            .is_some_and(|slide| now.duration_since(slide.started) >= SWITCH)
-        {
+        if self.slide.as_ref().is_some_and(|slide| slide.finished(now)) {
             self.slide = None;
         }
     }
-}
 
-pub fn progress(now: Instant, start: Instant, duration: Duration) -> f64 {
-    (now.saturating_duration_since(start).as_secs_f64() / duration.as_secs_f64()).min(1.0)
+    pub fn settle(&mut self) {
+        self.slide = None;
+    }
 }
 
 #[cfg(test)]
@@ -63,9 +50,9 @@ mod tests {
         let start = Instant::now();
         let midway = start + SWITCH / 2;
         let mut workspaces = Workspaces::default();
-        workspaces.select(2, start);
+        workspaces.select(2, start, true);
         assert_eq!(workspaces.position(midway), 1.0);
-        workspaces.select(0, midway);
+        workspaces.select(0, midway, true);
         assert_eq!(workspaces.position(midway), 1.0);
         assert_eq!(workspaces.position(midway + SWITCH), 0.0);
         workspaces.finish_frame(midway + SWITCH);

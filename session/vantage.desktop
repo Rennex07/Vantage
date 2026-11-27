@@ -1,0 +1,6 @@
+[Desktop Entry]
+Name=Vantage
+Comment=Vantage Wayland desktop session
+Exec=/usr/bin/env XDG_CURRENT_DESKTOP=Vantage /usr/local/bin/vantage --tty
+TryExec=/usr/local/bin/vantage
+Type=Application

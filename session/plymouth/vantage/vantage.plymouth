@@ -1,0 +1,53 @@
+[Plymouth Theme]
+Name=Vantage
+Description=Vantage in Roboto Black over a midnight blue boot splash
+ModuleName=two-step
+
+[two-step]
+ImageDir=/usr/share/plymouth/themes/vantage
+Font=Roboto 12
+TitleFont=Roboto Black 26
+BackgroundStartColor=0x101c31
+BackgroundEndColor=0x050916
+HorizontalAlignment=.5
+VerticalAlignment=.58
+WatermarkHorizontalAlignment=.5
+WatermarkVerticalAlignment=.41
+DialogHorizontalAlignment=.5
+DialogVerticalAlignment=.63
+TitleHorizontalAlignment=.5
+TitleVerticalAlignment=.37
+ProgressBarBackgroundColor=0x263c5e
+ProgressBarForegroundColor=0x9bd6ff
+Transition=none
+MessageBelowAnimation=true
+
+[boot-up]
+UseEndAnimation=false
+
+[shutdown]
+UseEndAnimation=false
+
+[reboot]
+UseEndAnimation=false
+
+[updates]
+SuppressMessages=true
+UseProgressBar=true
+ProgressBarShowPercentComplete=true
+Title=Installing updates
+SubTitle=Keep the computer on while updates finish
+
+[system-upgrade]
+SuppressMessages=true
+UseProgressBar=true
+ProgressBarShowPercentComplete=true
+Title=Upgrading the system
+SubTitle=Keep the computer on while updates finish
+
+[firmware-upgrade]
+SuppressMessages=true
+UseProgressBar=true
+ProgressBarShowPercentComplete=true
+Title=Updating firmware
+SubTitle=Keep the computer on while updates finish

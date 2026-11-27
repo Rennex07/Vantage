@@ -2,7 +2,10 @@ use std::time::{Duration, Instant};
 
 use smithay::utils::{Logical, Point, Rectangle, Size};
 
-use super::{launch::App, workspaces::progress};
+use super::{
+    launch::App,
+    timeline::{Ease, progress},
+};
 
 pub const LAUNCH_TIMEOUT: Duration = Duration::from_secs(6);
 const LEAVE_DOCK: Duration = Duration::from_millis(145);
@@ -20,7 +23,7 @@ pub struct Launch {
 impl Launch {
     pub fn tile(self, now: Instant) -> Rectangle<f64, Logical> {
         let phase = progress(now, self.started, LEAVE_DOCK);
-        let lift = ease(phase);
+        let lift = Ease::Out.sample(phase);
         let size = Size::from((44.0 - 14.0 * lift, 39.0 - 19.0 * lift));
         let center = self.anchor - Point::from((0.0, 54.0 * lift));
         Rectangle::new(center - Point::from((size.w / 2.0, size.h / 2.0)), size)
@@ -49,7 +52,7 @@ impl Opening {
 
     pub fn pose(&self, now: Instant, target: Rectangle<f64, Logical>) -> Pose {
         let Some(launch) = self.launch else {
-            let p = ease(progress(now, self.start, OTHER_OPENING));
+            let p = Ease::Out.sample(progress(now, self.start, OTHER_OPENING));
             return Pose {
                 rect: Rectangle::new(
                     target.loc + Point::from((0.0, 22.0 * (1.0 - p))),
@@ -70,9 +73,9 @@ impl Opening {
         let origin = launch.tile(self.start);
         let from = center(origin);
         let to = center(target);
-        let flight = smooth((p / 0.46).min(1.0));
-        let expand = ease(((p - 0.22) / 0.78).clamp(0.0, 1.0));
-        let reveal = smooth(((p - 0.46) / 0.44).clamp(0.0, 1.0)) as f32;
+        let flight = Ease::Smooth.sample((p / 0.46).min(1.0));
+        let expand = Ease::Out.sample(((p - 0.22) / 0.78).clamp(0.0, 1.0));
+        let reveal = Ease::Smooth.sample(((p - 0.46) / 0.44).clamp(0.0, 1.0)) as f32;
         let size = origin.size + (target.size - origin.size).upscale(expand);
         let position = from + (to - from).upscale(flight);
         Pose {
@@ -91,14 +94,6 @@ pub struct Pose {
 
 fn center(rect: Rectangle<f64, Logical>) -> Point<f64, Logical> {
     rect.loc + Point::from((rect.size.w / 2.0, rect.size.h / 2.0))
-}
-
-fn ease(t: f64) -> f64 {
-    1.0 - (1.0 - t).powi(3)
-}
-
-fn smooth(t: f64) -> f64 {
-    t * t * (3.0 - 2.0 * t)
 }
 
 #[cfg(test)]
