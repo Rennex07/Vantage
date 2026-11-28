@@ -357,6 +357,7 @@ impl State {
                         behind: windows.elements.len(),
                         bounds,
                         opacity: pose.opacity,
+                        radius: 22.0,
                         theme,
                     });
                 }
@@ -438,7 +439,7 @@ impl State {
         let stamp = smithay::utils::Clock::<smithay::utils::Monotonic>::new().now();
         if self.lock_active() {
             if locked_frame {
-                self.lock_frame_presented(stamp.into());
+                self.lock_frame_presented();
             }
             return;
         }
@@ -556,7 +557,7 @@ fn frost_theme(window: &Window, theme: crate::palette::Theme) -> Option<crate::p
             window.user_data().insert_if_missing(|| theme);
             window.user_data().get::<crate::palette::Theme>().copied()
         } else {
-            (app_id == "org.vantage.Settings").then_some(theme)
+            matches!(app_id, "org.vantage.Settings" | "org.vantage.Apps").then_some(theme)
         }
     })
     .flatten()

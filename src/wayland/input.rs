@@ -45,6 +45,20 @@ impl State {
 
     fn move_pointer(&mut self, location: Point<f64, Logical>, serial: Serial, time: u32) {
         let pointer = self.pointer.clone();
+        if self.lock_active() {
+            pointer.motion(
+                self,
+                None,
+                &MotionEvent {
+                    location,
+                    serial,
+                    time,
+                },
+            );
+            pointer.frame(self);
+            self.lock_pointer_moved();
+            return;
+        }
         self.redraw |= self
             .dock_hits
             .as_ref()
@@ -79,9 +93,7 @@ impl State {
     }
     pub fn host_focus(&mut self, focused: bool) {
         self.host_focused = focused;
-        if focused && self.lock_active() {
-            self.update_lock_focus();
-        } else if focused {
+        if focused {
             let keyboard = self.keyboard.clone();
             if keyboard.current_focus().is_none() {
                 self.focus_last_window();
@@ -125,58 +137,49 @@ impl State {
         let serial = SERIAL_COUNTER.next_serial();
         let (open_app, open_tool) = launchers;
 
-        if self.lock_active() {
+        if self.lock_active()
+            && !matches!(
+                input,
+                InputEvent::PointerMotion { .. } | InputEvent::PointerMotionAbsolute { .. }
+            )
+        {
+            if let InputEvent::PointerButton { ref event } = input
+                && self.host_focused
+                && event.button_code() == BUTTON_LEFT
+                && event.state() == ButtonState::Pressed
+            {
+                self.lock_click();
+            }
             if let InputEvent::Keyboard { ref event } = input
                 && self.host_focused
             {
                 let state = event.state();
-                if state == KeyState::Pressed {
-                    self.wake_lock();
-                }
                 let code = event.key_code();
-                let retry_locker = keyboard.input::<bool, _>(
+                let key = keyboard.input(
                     self,
                     code,
                     state,
                     serial,
                     event.time_msec(),
                     |data, modifiers, key| {
-                        if state == KeyState::Released && data.intercepted_keys.remove(&code.raw())
-                        {
-                            return FilterResult::Intercept(false);
-                        }
-                        if state == KeyState::Pressed
-                            && modifiers.logo
-                            && key.modified_sym().raw() == keysyms::KEY_l
-                            && data.lock_surface().is_none()
-                        {
+                        let pressed = state == KeyState::Pressed;
+                        if pressed {
                             data.intercepted_keys.insert(code.raw());
-                            FilterResult::Intercept(true)
-                        } else if data.lock_surface().is_some() {
-                            FilterResult::Forward
                         } else {
-                            FilterResult::Intercept(false)
+                            data.intercepted_keys.remove(&code.raw());
                         }
+                        let symbol = key.modified_sym();
+                        let character = if modifiers.ctrl || modifiers.logo {
+                            None
+                        } else {
+                            symbol.key_char()
+                        };
+                        FilterResult::Intercept(pressed.then_some((symbol.raw(), character)))
                     },
                 );
-                if retry_locker == Some(true)
-                    && let Err(error) = self.start_locker()
-                {
-                    eprintln!("Could not restart the screen locker: {error}");
+                if let Some(Some((symbol, character))) = key {
+                    self.lock_key(symbol, character);
                 }
-            } else if let InputEvent::PointerButton { event } = input {
-                if event.state() == ButtonState::Pressed {
-                    self.wake_lock();
-                }
-                pointer.button(
-                    self,
-                    &ButtonEvent {
-                        button: event.button_code(),
-                        state: event.state(),
-                        serial,
-                        time: event.time_msec(),
-                    },
-                );
             }
             return;
         }
@@ -217,10 +220,15 @@ impl State {
                                 data.switch_window(if modifiers.shift { -1 } else { 1 });
                                 true
                             } else if data.native_session
-                                && modifiers.logo
                                 && !modifiers.ctrl
                                 && !modifiers.alt
-                                && symbol == keysyms::KEY_l
+                                && ((modifiers.logo && symbol == keysyms::KEY_l)
+                                    || (!modifiers.logo
+                                        && !modifiers.shift
+                                        && matches!(
+                                            symbol,
+                                            keysyms::KEY_F9 | keysyms::KEY_XF86ScreenSaver
+                                        )))
                             {
                                 request_lock = true;
                                 true
@@ -494,18 +502,17 @@ impl State {
         match action {
             Action::Overview => self.toggle_overview(),
             Action::Power => self.status_panel = Panel::Power,
-            Action::Lock | Action::Suspend => {
+            Action::Lock => {
                 let error = if super::lock::local_password_missing() {
                     Some("Set a Debian password in Console first.")
                 } else if let Err(error) = self.start_locker() {
                     eprintln!("Could not open screen locker: {error}");
                     Some(if error.kind() == io::ErrorKind::NotFound {
-                        "Screen lock needs the swaylock package."
+                        "Screen lock needs the Vantage PAM configuration."
                     } else {
                         "Could not open the screen locker."
                     })
                 } else {
-                    self.lock.suspend_pending = action == Action::Suspend;
                     self.status_panel = Panel::Closed;
                     None
                 };
@@ -575,11 +582,9 @@ impl SeatHandler for State {
     }
 
     fn focus_changed(&mut self, seat: &Seat<Self>, surface: Option<&WlSurface>) {
-        let client = surface.and_then(Resource::client).filter(|client| {
-            !client
-                .get_data::<super::ClientState>()
-                .is_some_and(|data| data.locker)
-        });
+        let client = surface
+            .and_then(Resource::client)
+            .filter(|_| !self.lock_active());
         set_data_device_focus(&self.display, seat, client);
     }
 

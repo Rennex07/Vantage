@@ -252,7 +252,7 @@ fn preview(parent: &gtk::ApplicationWindow, wallpaper: bool) {
     layout.set_margin_start(24);
     layout.set_margin_end(24);
     let top = gtk::Box::new(gtk::Orientation::Horizontal, 12);
-    let caption = label("Preview · Sample time and date");
+    let caption = label("Always-on display preview");
     caption.add_css_class("aod-caption");
     caption.set_hexpand(true);
     top.append(&caption);
@@ -280,8 +280,14 @@ fn preview(parent: &gtk::ApplicationWindow, wallpaper: bool) {
     wake_content.set_halign(gtk::Align::Center);
     wake_content.set_margin_top(20);
     wake_content.add_css_class("aod-wake");
-    wake_content.append(&gtk::Label::new(Some("Wake screen sample")));
-    wake_content.append(&gtk::Label::new(Some("Unlock controls appear here")));
+    let account = gtk::Label::new(Some(&glib::user_name().to_string_lossy()));
+    account.add_css_class("aod-account");
+    let password = gtk::Box::new(gtk::Orientation::Horizontal, 100);
+    password.add_css_class("aod-password");
+    password.append(&gtk::Label::new(Some("Password")));
+    password.append(&gtk::Image::from_icon_name("go-next-symbolic"));
+    wake_content.append(&account);
+    wake_content.append(&password);
     let reveal = gtk::Revealer::builder()
         .transition_type(gtk::RevealerTransitionType::Crossfade)
         .transition_duration(if preferences::appearance().reduce_motion {
@@ -291,16 +297,17 @@ fn preview(parent: &gtk::ApplicationWindow, wallpaper: bool) {
         })
         .child(&wake_content)
         .build();
-    let wake_slot = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    wake_slot.set_height_request(100);
-    wake_slot.append(&reveal);
-    center.append(&wake_slot);
+    reveal.set_hexpand(true);
+    reveal.set_vexpand(true);
+    reveal.set_valign(gtk::Align::Center);
     layout.append(&center);
     let wake = gtk::Button::with_label("Preview wake");
     wake.set_halign(gtk::Align::Center);
+    let sign_preview = reveal.clone();
     wake.connect_clicked(move |button| {
-        let active = !reveal.reveals_child();
-        reveal.set_reveal_child(active);
+        let active = !sign_preview.reveals_child();
+        sign_preview.set_reveal_child(active);
+        center.set_opacity(f64::from(!active));
         if let Some(scrim) = &scrim {
             if active {
                 scrim.add_css_class("aod-awake");
@@ -315,6 +322,7 @@ fn preview(parent: &gtk::ApplicationWindow, wallpaper: bool) {
         });
     });
     layout.append(&wake);
+    scene.add_overlay(&reveal);
     scene.add_overlay(&layout);
     window.set_child(Some(&scene));
     let keys = gtk::EventControllerKey::new();
@@ -344,7 +352,7 @@ fn install_preview_style(parent: &gtk::ApplicationWindow) {
          .aod-clock { font-family: Roboto, sans-serif; font-size: 76px; font-weight: 900; color: #f5f7ff; }
          .aod-date { font-size: 17px; color: #d7deec; }
          .aod-caption { color: #d7deec; }
-         .aod-wake { background: rgba(18, 28, 46, 0.94); border-radius: 14px; padding: 16px; }",
+         .aod-wake { background: linear-gradient(rgba(90, 102, 128, 0.88), rgba(18, 28, 46, 0.88) 18%);\n                     border: 1px solid alpha(white, 0.40); border-radius: 27px; padding: 20px; }\n         .aod-account { font-size: 20px; font-weight: 700; color: white; }\n         .aod-password { border-radius: 18px; background: rgba(8, 16, 28, 0.82);\n                         padding: 9px 15px; color: white; }",
     );
     gtk::style_context_add_provider_for_display(
         &WidgetExt::display(parent),

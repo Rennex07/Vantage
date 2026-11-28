@@ -38,10 +38,11 @@ On Debian 13, install the desktop utilities alongside the build dependencies abo
 
 ```sh
 sudo apt install network-manager blueman pavucontrol pulseaudio-utils \
-    pipewire-pulse wireplumber lxpolkit swaylock
+    pipewire-pulse wireplumber lxpolkit
 sudo install -Dm755 target/debug/vantage /usr/local/bin/vantage
 sudo install -Dm755 target/debug/vantage-console /usr/local/bin/vantage-console
 sudo install -Dm644 session/vantage.desktop /usr/share/wayland-sessions/vantage.desktop
+sudo install -Dm644 session/pam/vantage-lock /etc/pam.d/vantage-lock
 ```
 
 Select **Vantage** at a display manager that supports Wayland sessions, such as
@@ -59,13 +60,13 @@ device directly, with **Advanced mixer** for input devices and per-app volume.
 Vantage session. **Connectivity** opens NetworkManager for Wi-Fi and Blueman
 for Bluetooth. The top panel reports battery and USB storage status when available.
 
-Open **Quick settings → Power** to lock, suspend, shut down, or log out.
-**Super+L** also locks the session. The lock screen dims to full-screen
-always-on display after six seconds. Press a key or click to wake and use your
-Debian password to unlock. Set a password first if Debian uses automatic login
-with a locked account. In **Settings → Appearance**, choose full-screen
-wallpaper, clock only, or off. **Suspend** requests sleep after the lock is
-visible. **Shut down** and **Log out** prompt for confirmation.
+Open **Quick settings → Power** to lock or shut down. **F9** and **Super+L**
+also lock the session. After five seconds, the wallpaper dims as the clock
+moves down and grows. Press a key or click to show the current account's
+password field. Vantage verifies the password with Debian PAM. Set a Debian
+password before locking an account configured for automatic login. In
+**Settings → Appearance**, choose full-screen wallpaper, clock only, or off.
+**Shut down** prompts for confirmation.
 **Alt+F4** closes the focused app.
 
 ## Install the boot splash

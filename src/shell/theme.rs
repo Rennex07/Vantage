@@ -48,17 +48,35 @@ pub fn draw_card(
     paint_card(context, width, height, radius, opacity, false)
 }
 
-pub fn palette_card(
+pub fn glass_surface(
     context: &Context,
-    (width, height): (f64, f64),
+    bounds: (f64, f64, f64, f64),
     radius: f64,
-    colors: crate::palette::Palette,
-    alpha: f64,
+    tint: crate::palette::Color,
+    opacity: f64,
 ) -> Result<(), CairoError> {
-    rounded(context, (1.0, 1.0, width - 2.0, height - 2.0), radius);
-    ink(context, colors.base, alpha);
+    let (x, y, w, h) = bounds;
+    let rim = crate::palette::mix(tint, (1.0, 0.99, 0.98), 0.70);
+    let shoulder = crate::palette::mix(tint, (1.0, 1.0, 1.0), 0.18);
+    let body = vte4::gtk::cairo::LinearGradient::new(x, y, x, y + h);
+    body.add_color_stop_rgba(0.0, rim.0, rim.1, rim.2, opacity);
+    body.add_color_stop_rgba(
+        (6.0 / h).min(0.20),
+        shoulder.0,
+        shoulder.1,
+        shoulder.2,
+        opacity,
+    );
+    body.add_color_stop_rgba(0.27, tint.0, tint.1, tint.2, opacity);
+    body.add_color_stop_rgba(1.0, tint.0, tint.1, tint.2, opacity);
+    rounded(context, bounds, radius);
+    context.set_source(body)?;
     context.fill_preserve()?;
-    ink(context, colors.accent, 0.48);
+    let edge = vte4::gtk::cairo::LinearGradient::new(x, y, x + w * 0.55, y + h);
+    edge.add_color_stop_rgba(0.0, 1.0, 1.0, 1.0, 0.91);
+    edge.add_color_stop_rgba(0.48, 1.0, 1.0, 1.0, 0.33);
+    edge.add_color_stop_rgba(1.0, 1.0, 1.0, 1.0, 0.53);
+    context.set_source(edge)?;
     context.set_line_width(1.0);
     context.stroke()
 }

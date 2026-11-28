@@ -434,29 +434,38 @@ fn apply_style(style: &gtk::CssProvider, appearance: preferences::Appearance) {
     let accent = hex(colors.accent);
     let warning = hex(colors.warning);
     let duration = if appearance.reduce_motion { 0 } else { 200 };
+    let tint =
+        if appearance.reduce_transparency || appearance.effects == preferences::Effects::Reduced {
+            1.0
+        } else {
+            0.80
+        };
     style.load_from_string(&format!(
-        "window {{ background: {base}; color: {text}; font-family: Roboto, sans-serif; }}
+        "window {{ background: alpha({base}, {tint}); color: {text}; font-family: Roboto, sans-serif; }}
          .title-1, .title-2 {{ font-weight: 900; }}
          button, row, flowboxchild {{ transition: background-color {duration}ms ease-out; }}
-         headerbar {{ background: linear-gradient({raised}, {surface}); color: {text};
-                      border-bottom: 1px solid {raised}; box-shadow: none; }}
+         headerbar {{ background: linear-gradient(shade({raised}, 1.16), {surface}); color: {text};
+                      border-bottom: 1px solid {selected}; box-shadow: inset 0 2px alpha(white, 0.45); }}
          searchentry, dropdown button, popover contents, .boxed-list,
          button {{ background: {surface}; color: {text}; }}
-         button, searchentry, dropdown button {{ border-color: {selected}; }}
+         button, searchentry, dropdown button {{
+             background: linear-gradient({raised}, {surface}); border-color: {selected};
+             border-top-color: alpha(white, 0.40); border-radius: 16px;
+         }}
          button:hover, .boxed-list row:hover {{ background: {raised}; }}
          button:focus-visible, searchentry:focus-within, dropdown button:focus-visible {{
              outline: 2px solid {accent}; outline-offset: -2px;
          }}
          .settings-row {{ background: linear-gradient({raised}, {surface}); color: {text};
                           border: 1px solid {selected}; border-top-color: alpha(white, 0.45);
-                          border-radius: 12px; padding: 11px 14px; }}
+                          border-radius: 18px; padding: 11px 14px; }}
          .settings-row:hover {{ background: {selected}; }}
          .boxed-list row:selected, .vantage-settings stackswitcher button:checked {{
              background: {selected}; color: {text};
          }}
          .color-grid flowboxchild {{
              background: {surface}; color: {text}; border: 1px solid {selected};
-             border-radius: 11px; padding: 9px;
+             border-radius: 16px; padding: 9px;
          }}
          .color-grid flowboxchild:hover {{ background: {raised}; }}
          .color-grid flowboxchild:selected {{ background: {selected}; border-color: {accent}; }}

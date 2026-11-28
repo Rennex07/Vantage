@@ -244,58 +244,118 @@ impl Scene {
             state.appearance.reduce_motion,
         )?;
         let bounds = Rectangle::from_size(size);
+        let cursor_size = ((14.0 * scale).round() as i32, (18.0 * scale).round() as i32);
         let light = state.appearance.theme.mode == ColorMode::Light;
-        let lock_wallpaper = if light { 0.50 } else { 0.92 };
+        let lock_wallpaper = if light { 0.56 } else { 0.94 };
+        let unlocking = state.unlock_amount(now);
+        let sign_bounds = crate::shell::lockscreen::sign_bounds(size.w, size.h);
+        let solid_lock =
+            state.appearance.reduce_transparency || state.appearance.effects == Effects::Reduced;
+        let (reveal, dim, sign) = state.lock_amounts(now);
+        let blur_amount = if state.lock_active() { sign } else { unlocking };
+        let lock_blur = if blur_amount > 0.0 && !solid_lock {
+            self.glass.as_mut().and_then(|glass| {
+                glass
+                    .lock_blur(
+                        renderer,
+                        &wallpaper,
+                        size,
+                        state.appearance.theme,
+                        self.wallpaper.animating(now),
+                    )
+                    .map_err(|error| eprintln!("Could not blur the lock backdrop: {error}"))
+                    .ok()
+            })
+        } else {
+            None
+        };
         if state.lock_active() {
             self.panel_motion = PanelMotion::default();
-            let (reveal, dim) = state.lock_amounts(now);
-            let (aod_wallpaper, aod_clock) = match state.appearance.aod {
-                Aod::Wallpaper => (if light { 0.22 } else { 0.37 }, 0.56),
-                Aod::Classic => (0.0, 0.56),
-                Aod::Off => (lock_wallpaper, 1.0),
+            let ambient = match state.appearance.aod {
+                Aod::Wallpaper => {
+                    if light {
+                        0.26
+                    } else {
+                        0.40
+                    }
+                }
+                Aod::Classic => 0.0,
+                Aod::Off => lock_wallpaper,
             };
             let clock = self
                 .lockscreen
                 .clock(renderer, size, &state.status)?
                 .clone();
-            let hint = self.lockscreen.hint(renderer)?;
-            let auth = reveal * (1.0 - dim);
-            let elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = state
-                .lock_surface()
-                .map(|surface| {
-                    render_elements_from_surface_tree(
-                        renderer,
-                        surface,
-                        (0, 0),
-                        1.0,
-                        auth,
-                        Kind::Unspecified,
-                    )
-                })
-                .unwrap_or_default();
+            let clock_alpha = reveal * (1.0 - sign);
+            let hint_alpha = clock_alpha * (1.0 - dim);
+            let sign_alpha = reveal * sign;
+            let hint = if hint_alpha > 0.0 {
+                Some(
+                    self.lockscreen
+                        .hint(renderer, state.appearance.theme)?
+                        .clone(),
+                )
+            } else {
+                None
+            };
+            let sign_texture = if sign_alpha > 0.0 {
+                Some(
+                    self.lockscreen
+                        .sign_in(
+                            renderer,
+                            sign_bounds.size.w,
+                            state.appearance.theme,
+                            state.lock_sign_in(),
+                            solid_lock || lock_blur.is_none(),
+                        )?
+                        .clone(),
+                )
+            } else {
+                None
+            };
             let mut frame = renderer.render(target, size, transform)?;
-            frame.clear([0.010, 0.014, 0.025, 1.0].into(), &[bounds])?;
-            let brightness =
-                1.0 - reveal + reveal * (lock_wallpaper + (aod_wallpaper - lock_wallpaper) * dim);
-            wallpaper::draw(&mut frame, &wallpaper, bounds, brightness)?;
+            wallpaper::draw(&mut frame, &wallpaper, bounds, 1.0)?;
+            if let Some(blur) = lock_blur.as_ref() {
+                wallpaper::draw(&mut frame, blur, bounds, sign_alpha)?;
+            }
+            let brightness = lock_wallpaper + (ambient - lock_wallpaper) * dim;
+            let scrim = reveal * (1.0 - brightness * (1.0 - 0.20 * sign));
+            frame.draw_solid(bounds, &[bounds], [0.0, 0.0, 0.0, scrim].into())?;
             draw_texture_with_opacity(
                 &mut frame,
                 &clock,
-                lock_clock_bounds(&clock, bounds),
+                lock_clock_bounds(&clock, bounds, dim, sign),
                 bounds,
-                reveal * (1.0 + (aod_clock - 1.0) * dim),
+                clock_alpha,
             )?;
-            if auth > 0.0 && !elements.is_empty() {
-                let hx = (size.w - hint.size().w) / 2;
-                let hy = size.h - hint.size().h - (size.h / 12).max(12);
+            if let Some(hint) = hint {
+                let width = (f64::from(hint.size().w) * scale).round() as i32;
+                let height = (f64::from(hint.size().h) * scale).round() as i32;
+                let size_hint = (width, height).into();
+                let hx = (size.w - width) / 2;
+                let hy = size.h - height - (size.h / 10).max(12);
                 draw_texture_with_opacity(
                     &mut frame,
-                    hint,
-                    Rectangle::new((hx, hy).into(), (hint.size().w, hint.size().h).into()),
+                    &hint,
+                    Rectangle::new((hx, hy).into(), size_hint),
                     bounds,
-                    auth,
+                    hint_alpha,
                 )?;
-                draw_render_elements(&mut frame, 1.0, &elements, &[bounds])?;
+            }
+            if let Some(sign_texture) = sign_texture {
+                let mut position = sign_bounds;
+                position.loc.y += (18.0 * (1.0 - sign)).round() as i32;
+                draw_texture_with_opacity(&mut frame, &sign_texture, position, bounds, sign_alpha)?;
+                if let Some(cursor) = &self.cursor {
+                    let pointer = state.pointer_location().to_i32_round();
+                    draw_texture_with_opacity(
+                        &mut frame,
+                        cursor,
+                        Rectangle::new((pointer.x, pointer.y).into(), cursor_size.into()),
+                        bounds,
+                        sign_alpha,
+                    )?;
+                }
             }
             return Ok(frame.finish()?);
         }
@@ -308,7 +368,7 @@ impl Scene {
         let panel_amount =
             self.panel_motion
                 .amount(state.status_panel, now, state.appearance.reduce_motion);
-        let mut panel_bounds = status::panel_bounds(size, top);
+        let mut panel_bounds = status::panel_bounds(size, top, self.panel_motion.visible);
         panel_bounds.loc.y -= ((1.0 - panel_amount) * 8.0).round() as i32;
         state.status_hits = Some((top, panel_bounds));
         let solid = state.appearance.reduce_transparency
@@ -370,6 +430,7 @@ impl Scene {
                     behind: 0,
                     bounds: panel_bounds,
                     opacity: panel_amount as f32,
+                    radius: status::panel_radius(panel_bounds),
                     theme: state.appearance.theme,
                 },
             );
@@ -460,11 +521,16 @@ impl Scene {
                     .insert("No open windows".into(), texture);
             }
         }
-        let unlocking = state.unlock_amount(now);
-        let unlock_clock = if unlocking > 0.0 {
+        let unlock_sign = if unlocking > 0.0 {
             Some(
                 self.lockscreen
-                    .clock(renderer, size, &state.status)?
+                    .sign_in(
+                        renderer,
+                        sign_bounds.size.w,
+                        state.appearance.theme,
+                        state.lock_sign_in(),
+                        solid_lock || lock_blur.is_none(),
+                    )?
                     .clone(),
             )
         } else {
@@ -637,24 +703,16 @@ impl Scene {
             );
             draw_texture(&mut frame, texture, rect, bounds)?;
         }
-        if let Some(clock) = unlock_clock {
-            // Only the clock and trusted wallpaper cross the unlock boundary.
-            let shade = unlocking * (1.0 - lock_wallpaper);
-            // Compensate for the scrim so the clock and wallpaper fade as one layer.
+        if let Some(sign) = unlock_sign {
+            let shade = unlocking * (1.0 - lock_wallpaper * 0.8);
             wallpaper::draw(
                 &mut frame,
-                &wallpaper,
+                lock_blur.as_ref().unwrap_or(&wallpaper),
                 bounds,
-                unlocking * lock_wallpaper / (1.0 - shade),
+                (unlocking - shade) / (1.0 - shade),
             )?;
             frame.draw_solid(bounds, &[bounds], [0.0, 0.0, 0.0, shade].into())?;
-            draw_texture_with_opacity(
-                &mut frame,
-                &clock,
-                lock_clock_bounds(&clock, bounds),
-                bounds,
-                unlocking,
-            )?;
+            draw_texture_with_opacity(&mut frame, &sign, sign_bounds, bounds, unlocking)?;
         }
         if !state.appearance.reduce_motion {
             let entrance =
@@ -677,7 +735,7 @@ impl Scene {
         } else if let Some(cursor) = &self.cursor
             && !matches!(state.cursor(), CursorImageStatus::Hidden)
         {
-            let target = Rectangle::new((pointer.x, pointer.y).into(), (14, 18).into());
+            let target = Rectangle::new((pointer.x, pointer.y).into(), cursor_size.into());
             if let Some(visible) = target.intersection(bounds) {
                 Frame::render_texture_from_to(
                     &mut frame,
@@ -702,10 +760,15 @@ impl Scene {
 fn lock_clock_bounds(
     clock: &GlesTexture,
     bounds: Rectangle<i32, Physical>,
+    dim: f32,
+    signing_in: f32,
 ) -> Rectangle<i32, Physical> {
-    let (w, h) = (clock.size().w, clock.size().h);
+    let scale = (0.86 + 0.14 * dim) * (1.0 - 0.06 * signing_in);
+    let w = (clock.size().w as f32 * scale).round().max(1.0) as i32;
+    let h = (clock.size().h as f32 * scale).round().max(1.0) as i32;
+    let center = bounds.size.h as f32 * (0.33 + 0.085 * dim - 0.035 * signing_in);
     Rectangle::new(
-        ((bounds.size.w - w) / 2, (bounds.size.h - h) / 4).into(),
+        ((bounds.size.w - w) / 2, center.round() as i32 - h / 2).into(),
         (w, h).into(),
     )
 }
@@ -733,7 +796,7 @@ fn overview_label(
 ) -> Result<GlesTexture, Box<dyn Error>> {
     use vte4::gtk::cairo::FontWeight;
     theme::texture(renderer, (230, 26).into(), |context| {
-        theme::palette_card(context, (230.0, 26.0), 8.0, colors, 0.98)?;
+        theme::glass_surface(context, (1.0, 1.0, 228.0, 24.0), 12.0, colors.base, 0.95)?;
         theme::font(context, 12.0, FontWeight::Bold);
         theme::ink(context, colors.text, 1.0);
         let mut title = title.to_owned();
@@ -815,7 +878,7 @@ fn notice_texture(
 ) -> Result<GlesTexture, Box<dyn Error>> {
     use vte4::gtk::cairo::FontWeight;
     theme::texture(renderer, (376, 68).into(), |context| {
-        theme::palette_card(context, (376.0, 68.0), 14.0, colors, 0.98)?;
+        theme::glass_surface(context, (1.0, 1.0, 374.0, 66.0), 22.0, colors.base, 0.95)?;
         theme::ink(context, colors.warning, 1.0);
         theme::dot(context, 19.0, 24.0, 3.0)?;
         theme::font(context, 14.0, FontWeight::Bold);

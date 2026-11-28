@@ -26,6 +26,7 @@ pub struct FrostedWindow {
     pub behind: usize,
     pub bounds: Rectangle<i32, Physical>,
     pub opacity: f32,
+    pub radius: f32,
     pub theme: Theme,
 }
 
@@ -38,6 +39,15 @@ pub struct Glass {
     gaussian: GlesTexProgram,
     frost: GlesTexProgram,
     textures: Option<Buffers>,
+    lock: Option<LockBlur>,
+}
+
+struct LockBlur {
+    size: Size<i32, Physical>,
+    theme: Theme,
+    moving: bool,
+    horizontal: GlesTexture,
+    vertical: GlesTexture,
 }
 
 struct Buffers {
@@ -63,12 +73,71 @@ impl Glass {
                     UniformName::new("panel_origin", UniformType::_2f),
                     UniformName::new("output_size", UniformType::_2f),
                     UniformName::new("panel_size", UniformType::_2f),
+                    UniformName::new("corner_radius", UniformType::_1f),
                     UniformName::new("surface_color", UniformType::_3f),
                     UniformName::new("daylight", UniformType::_1f),
                 ],
             )?,
             textures: None,
+            lock: None,
         })
+    }
+
+    pub fn lock_blur(
+        &mut self,
+        renderer: &mut GlesRenderer,
+        wallpaper: &GlesTexture,
+        size: Size<i32, Physical>,
+        theme: Theme,
+        moving: bool,
+    ) -> Result<GlesTexture, GlesError> {
+        if let Some(cache) = &self.lock
+            && cache.size == size
+            && cache.theme == theme
+            && !moving
+            && !cache.moving
+        {
+            return Ok(cache.vertical.clone());
+        }
+        let reduced = ((size.w / 12).max(1), (size.h / 12).max(1));
+        if self.lock.as_ref().is_none_or(|cache| cache.size != size) {
+            self.lock = Some(LockBlur {
+                size,
+                theme,
+                moving,
+                horizontal: renderer.create_buffer(Fourcc::Abgr8888, reduced.into())?,
+                vertical: renderer.create_buffer(Fourcc::Abgr8888, reduced.into())?,
+            });
+        }
+        let cache = self.lock.as_mut().expect("lock blur buffers allocated");
+        {
+            let mut target = renderer.bind(&mut cache.vertical)?;
+            let mut frame = renderer.render(&mut target, reduced.into(), SURFACE_TRANSFORM)?;
+            wallpaper::draw(
+                &mut frame,
+                wallpaper,
+                Rectangle::from_size(reduced.into()),
+                1.0,
+            )?;
+            let _ = frame.finish()?;
+        }
+        blur_pass(
+            renderer,
+            &self.gaussian,
+            &cache.vertical,
+            &mut cache.horizontal,
+            (1.0 / reduced.0 as f32, 0.0),
+        )?;
+        blur_pass(
+            renderer,
+            &self.gaussian,
+            &cache.horizontal,
+            &mut cache.vertical,
+            (0.0, 1.0 / reduced.1 as f32),
+        )?;
+        cache.theme = theme;
+        cache.moving = moving;
+        Ok(cache.vertical.clone())
     }
 
     pub fn compose(
@@ -176,6 +245,7 @@ impl Glass {
                 &[
                     Uniform::new("panel_origin", (x as f32, y as f32)),
                     Uniform::new("output_size", (size.w as f32, size.h as f32)),
+                    Uniform::new("corner_radius", panel.radius),
                     Uniform::new("surface_color", (r as f32, g as f32, b as f32)),
                     Uniform::new("daylight", daylight),
                     Uniform::new(

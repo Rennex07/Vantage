@@ -1,36 +1,31 @@
 use std::{
     io,
-    os::{fd::OwnedFd, unix::net::UnixStream},
-    process::{Child, Command, Stdio},
-    sync::Arc,
+    process::{Child, Command},
     time::{Duration, Instant},
 };
 
 use smithay::{
-    delegate_session_lock,
-    desktop::utils::send_frames_surface_tree,
-    input::pointer::MotionEvent,
-    reexports::wayland_server::protocol::{wl_output::WlOutput, wl_surface::WlSurface},
+    input::{keyboard::keysyms, pointer::MotionEvent},
     utils::SERIAL_COUNTER,
-    wayland::session_lock::{
-        LockSurface, SessionLockHandler, SessionLockManagerState, SessionLocker,
-    },
 };
 
-use super::{ClientState, State};
+use super::State;
 use crate::{
+    lock_auth::{Password, SERVICE_PATH},
     preferences::Aod,
     shell::{
+        lockscreen::{self, SignIn, SignInStatus},
         status::Panel,
         timeline::{Ease, Transition, progress},
     },
 };
 
-const DIM_AFTER_LOCK: Duration = Duration::from_secs(6);
+const DIM_AFTER_LOCK: Duration = Duration::from_secs(5);
 const DIM_AFTER_INPUT: Duration = Duration::from_secs(18);
-const DIM_DURATION: Duration = Duration::from_millis(750);
-const WAKE_DURATION: Duration = Duration::from_millis(310);
-const UNLOCK_DURATION: Duration = Duration::from_millis(360);
+const DIM_DURATION: Duration = Duration::from_millis(850);
+const WAKE_DURATION: Duration = Duration::from_millis(360);
+const SIGN_DURATION: Duration = Duration::from_millis(310);
+const UNLOCK_DURATION: Duration = Duration::from_millis(400);
 
 struct Idle {
     dim_at: Instant,
@@ -66,49 +61,63 @@ impl Idle {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum LockPhase {
-    Desktop,
-    Covering,
-    Covered,
-}
-
 pub(super) struct Lock {
-    manager: SessionLockManagerState,
-    phase: LockPhase,
-    pub(super) suspend_pending: bool,
-    suspend_job: Option<Child>,
-    pending: Option<SessionLocker>,
-    surface: Option<LockSurface>,
-    child: Option<Child>,
-    poweroff: Option<Child>,
-    idle: Idle,
+    active: bool,
     covered_at: Option<Instant>,
     unlocked_at: Option<Instant>,
+    idle: Idle,
+    signing_in: bool,
+    sign_transition: Option<Transition>,
+    password: Password,
+    user: String,
+    status: SignInStatus,
+    auth_job: Option<Child>,
+    poweroff: Option<Child>,
 }
 
 impl Lock {
-    pub fn new(display: &smithay::reexports::wayland_server::DisplayHandle) -> Self {
+    pub fn new() -> Self {
         Self {
-            manager: SessionLockManagerState::new::<State, _>(display, |client| {
-                client
-                    .get_data::<ClientState>()
-                    .is_some_and(|data| data.locker)
-            }),
-            phase: LockPhase::Desktop,
-            suspend_pending: false,
-            suspend_job: None,
-            pending: None,
-            surface: None,
-            child: None,
-            poweroff: None,
+            active: false,
+            covered_at: None,
+            unlocked_at: None,
             idle: Idle {
                 dim_at: Instant::now(),
                 waking: None,
                 dim_started: false,
             },
-            covered_at: None,
-            unlocked_at: None,
+            signing_in: false,
+            sign_transition: None,
+            password: Password::default(),
+            user: vte4::gtk::glib::user_name().to_string_lossy().into_owned(),
+            status: SignInStatus::Ready,
+            auth_job: None,
+            poweroff: None,
+        }
+    }
+
+    fn sign_amount(&self, now: Instant) -> f64 {
+        self.sign_transition
+            .as_ref()
+            .map_or(f64::from(self.signing_in), |sign| sign.value(now))
+    }
+
+    fn show_sign_in(&mut self, visible: bool, now: Instant, reduced: bool) {
+        if self.signing_in != visible {
+            self.sign_transition = (!reduced).then(|| {
+                Transition::new(
+                    self.sign_amount(now),
+                    f64::from(visible),
+                    now,
+                    SIGN_DURATION,
+                    Ease::Out,
+                )
+            });
+            self.signing_in = visible;
+        }
+        if !visible {
+            self.password.clear();
+            self.status = SignInStatus::Ready;
         }
     }
 }
@@ -126,100 +135,65 @@ pub(super) fn local_password_missing() -> bool {
 
 impl State {
     pub(super) fn start_locker(&mut self) -> io::Result<()> {
-        self.check_locker();
-        if self.lock.child.is_some() {
+        if self.lock_active() {
             return Ok(());
         }
-        let (server, client) = UnixStream::pair()?;
-        // Regular applications cannot bind the lock global. Pass swaylock its own connection.
-        let fd: OwnedFd = client.into();
-        let mut child = Command::new("swaylock")
-            .env("WAYLAND_SOCKET", "0")
-            .env_remove("WAYLAND_DISPLAY")
-            .stdin(Stdio::from(fd))
-            .args([
-                "--config",
-                "/dev/null",
-                "--ignore-empty-password",
-                "--indicator-caps-lock",
-                "--font",
-                "Roboto",
-                "--indicator-thickness",
-                "5",
-                "--indicator-radius",
-                "47",
-                "--color",
-                "00000000",
-                "--inside-color",
-                "0c152be6",
-                "--inside-wrong-color",
-                "391928e6",
-                "--inside-ver-color",
-                "133550e6",
-                "--ring-color",
-                "81bdf1b8",
-                "--ring-wrong-color",
-                "ffa6a6",
-                "--ring-ver-color",
-                "8cd7f5",
-                "--line-uses-inside",
-                "--separator-color",
-                "00000000",
-                "--key-hl-color",
-                "e6f7ff",
-                "--bs-hl-color",
-                "efbb83",
-                "--text-color",
-                "eaf3ff",
-                "--text-wrong-color",
-                "ffffff",
-                "--text-ver-color",
-                "ffffff",
-            ])
-            .spawn()?;
-        if let Err(error) = self.display.insert_client(
-            server,
-            Arc::new(ClientState {
-                locker: true,
-                ..Default::default()
-            }),
-        ) {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(error);
+        if !std::path::Path::new(SERVICE_PATH).is_file() {
+            return Err(io::Error::new(io::ErrorKind::NotFound, SERVICE_PATH));
         }
-        self.lock.child = Some(child);
-        if !self.lock_active() {
-            self.cover_desktop();
+        self.lock.active = true;
+        self.lock.covered_at = None;
+        self.lock.unlocked_at = None;
+        self.lock.show_sign_in(false, Instant::now(), true);
+        self.lock.sign_transition = None;
+        if self.overview.open {
+            self.toggle_overview();
         }
+        self.status_panel = Panel::Closed;
+        self.dock_pressed = None;
+        self.status_pressed = None;
+        self.dragged_window = None;
+        self.finish_resize();
+        let keyboard = self.keyboard.clone();
+        keyboard.unset_grab(self);
+        self.focus_window(None);
+        let pointer = self.pointer.clone();
+        let serial = SERIAL_COUNTER.next_serial();
+        pointer.unset_grab(self, serial, 0);
+        pointer.motion(
+            self,
+            None,
+            &MotionEvent {
+                location: pointer.current_location(),
+                serial,
+                time: 0,
+            },
+        );
+        pointer.frame(self);
+        self.redraw = true;
         Ok(())
     }
 
     pub(super) fn check_locker(&mut self) {
-        if self
-            .lock
-            .child
-            .as_mut()
-            .is_some_and(|child| matches!(child.try_wait(), Ok(Some(_))))
-        {
-            self.lock.child = None;
-            self.lock.pending = None;
-            self.lock.surface = None;
-            if self.lock_active() {
-                self.update_lock_focus();
-            }
-            if self.lock.suspend_pending {
-                self.lock.suspend_pending = false;
-                self.show_suspend_error();
-            }
-            self.redraw |= self.lock_active();
-        }
-        if let Some(job) = &mut self.lock.suspend_job
-            && let Ok(Some(status)) = job.try_wait()
-        {
-            self.lock.suspend_job = None;
-            if !status.success() {
-                self.show_suspend_error();
+        if let Some(job) = &mut self.lock.auth_job {
+            let result = match job.try_wait() {
+                Ok(None) => None,
+                Ok(Some(status)) => Some(status.code()),
+                Err(error) => {
+                    eprintln!("Could not wait for lock authentication: {error}");
+                    let _ = job.kill();
+                    let _ = job.wait();
+                    Some(None)
+                }
+            };
+            if let Some(result) = result {
+                self.lock.auth_job = None;
+                match result {
+                    Some(0) => self.unlock_session(),
+                    Some(1) => self.lock.status = SignInStatus::Incorrect,
+                    _ => self.lock.status = SignInStatus::Unavailable,
+                }
+                self.redraw = true;
             }
         }
         if let Some(job) = &mut self.lock.poweroff
@@ -230,10 +204,12 @@ impl State {
                 self.poweroff_failed();
             }
         }
-        if self.lock_active() && self.lock.covered_at.is_some() && self.appearance.aod != Aod::Off {
+        if self.lock_active() && self.lock.covered_at.is_some() {
             let now = Instant::now();
             if now >= self.lock.idle.dim_at && !self.lock.idle.dim_started {
                 self.lock.idle.dim_started = true;
+                self.lock
+                    .show_sign_in(false, now, self.appearance.reduce_motion);
                 self.redraw = true;
             }
         }
@@ -264,19 +240,11 @@ impl State {
         self.redraw = true;
     }
 
-    fn show_suspend_error(&mut self) {
-        self.status_error = Some("Could not suspend this system.");
-        if !self.lock_active() {
-            self.status_panel = Panel::Power;
-        }
-        self.redraw = true;
-    }
-
     pub fn lock_active(&self) -> bool {
-        self.lock.phase != LockPhase::Desktop
+        self.lock.active
     }
 
-    pub fn lock_amounts(&self, now: Instant) -> (f32, f32) {
+    pub fn lock_amounts(&self, now: Instant) -> (f32, f32, f32) {
         let reduced = self.appearance.reduce_motion;
         let reveal = self.lock.covered_at.map_or(0.0, |start| {
             Ease::Out.sample(progress(
@@ -294,13 +262,20 @@ impl State {
         } else {
             self.lock.idle.amount(now, reduced)
         };
-        (reveal as f32, dim as f32)
+        let sign = if reduced {
+            f64::from(self.lock.signing_in)
+        } else {
+            self.lock.sign_amount(now)
+        };
+        (reveal as f32, dim as f32, sign as f32)
     }
 
     pub fn lock_animating(&self, now: Instant) -> bool {
-        let (reveal, dim) = self.lock_amounts(now);
+        let (reveal, dim, sign) = self.lock_amounts(now);
         self.lock.covered_at.is_some()
-            && ((reveal < 1.0 && !self.appearance.reduce_motion) || (dim > 0.0 && dim < 1.0))
+            && ((reveal < 1.0 && !self.appearance.reduce_motion)
+                || (dim > 0.0 && dim < 1.0)
+                || (sign > 0.0 && sign < 1.0))
     }
 
     pub fn unlock_amount(&self, now: Instant) -> f32 {
@@ -312,43 +287,92 @@ impl State {
         })
     }
 
-    pub(super) fn wake_lock(&mut self) {
+    pub fn lock_sign_in(&self) -> SignIn<'_> {
+        let keyboard = self.keyboard.clone();
+        SignIn {
+            user: &self.lock.user,
+            dots: self.lock.password.len().min(28),
+            status: if self.lock.auth_job.is_some() {
+                SignInStatus::Checking
+            } else {
+                self.lock.status
+            },
+            caps_lock: keyboard.modifier_state().caps_lock,
+        }
+    }
+
+    fn show_lock_sign_in(&mut self, now: Instant) {
+        self.lock.idle.wake(now, self.appearance.reduce_motion);
         self.lock
-            .idle
-            .wake(Instant::now(), self.appearance.reduce_motion);
+            .show_sign_in(true, now, self.appearance.reduce_motion);
         self.redraw = true;
     }
 
-    pub fn lock_surface(&self) -> Option<&WlSurface> {
-        self.lock
-            .surface
-            .as_ref()
-            .filter(|surface| surface.alive())
-            .map(LockSurface::wl_surface)
-    }
-
-    pub(super) fn update_lock_focus(&mut self) {
-        let focus = self.lock_surface().filter(|_| self.host_focused).cloned();
-        let keyboard = self.keyboard.clone();
-        if keyboard.current_focus() != focus {
-            keyboard.set_focus(self, focus, SERIAL_COUNTER.next_serial());
-        }
-    }
-
-    pub(super) fn configure_locker(&self) {
-        if let Some(surface) = self.lock.surface.as_ref().filter(|surface| surface.alive())
-            && let Some(mode) = self.output.current_mode()
-        {
-            surface.with_pending_state(|state| {
-                state.size = Some((mode.size.w as u32, mode.size.h as u32).into())
-            });
-            surface.send_configure();
-        }
-    }
-
-    pub(super) fn lock_frame_presented(&mut self, stamp: Duration) {
-        self.lock.phase = LockPhase::Covered;
+    pub(super) fn lock_key(&mut self, symbol: u32, character: Option<char>) {
         if self.lock.covered_at.is_none() {
+            return;
+        }
+        let now = Instant::now();
+        if symbol == keysyms::KEY_Escape && self.lock.auth_job.is_none() {
+            self.lock.idle.wake(now, self.appearance.reduce_motion);
+            self.lock
+                .show_sign_in(false, now, self.appearance.reduce_motion);
+            self.redraw = true;
+            return;
+        }
+
+        let was_signing_in = self.lock.signing_in;
+        self.show_lock_sign_in(now);
+        if self.lock.auth_job.is_some() {
+            return;
+        }
+        match symbol {
+            keysyms::KEY_Return | keysyms::KEY_KP_Enter if was_signing_in => self.submit_password(),
+            keysyms::KEY_BackSpace => self.lock.password.pop(),
+            _ => {
+                if let Some(character) = character.filter(|character| !character.is_control()) {
+                    self.lock.status = SignInStatus::Ready;
+                    self.lock.password.push(character);
+                }
+            }
+        }
+    }
+
+    pub(super) fn lock_click(&mut self) {
+        if self.lock.covered_at.is_none() {
+            return;
+        }
+        if self.lock.signing_in
+            && let Some(mode) = self.output.current_mode()
+            && lockscreen::submit_contains(
+                mode.size.w,
+                mode.size.h,
+                self.pointer.current_location(),
+            )
+        {
+            self.submit_password();
+        }
+        self.show_lock_sign_in(Instant::now());
+    }
+
+    pub(super) fn lock_pointer_moved(&mut self) {
+        self.redraw |= self.lock.signing_in;
+    }
+
+    fn submit_password(&mut self) {
+        if self.lock.auth_job.is_none() && self.lock.password.len() > 0 {
+            match self.lock.password.submit() {
+                Ok(job) => self.lock.auth_job = Some(job),
+                Err(error) => {
+                    eprintln!("Could not start lock authentication: {error}");
+                    self.lock.status = SignInStatus::Unavailable;
+                }
+            }
+        }
+    }
+
+    pub(super) fn lock_frame_presented(&mut self) {
+        if self.lock.active && self.lock.covered_at.is_none() {
             let now = Instant::now();
             self.lock.covered_at = Some(now);
             self.lock.idle = Idle {
@@ -358,111 +382,16 @@ impl State {
             };
             self.redraw = true;
         }
-        if let Some(pending) = self.lock.pending.take() {
-            pending.lock();
-        }
-        if self.lock_surface().is_some() && std::mem::take(&mut self.lock.suspend_pending) {
-            match Command::new("systemctl")
-                .args(["--no-ask-password", "suspend"])
-                .spawn()
-            {
-                Ok(job) => self.lock.suspend_job = Some(job),
-                Err(error) => {
-                    eprintln!("Could not suspend: {error}");
-                    self.show_suspend_error();
-                }
-            }
-        }
-        if let Some(surface) = self.lock_surface() {
-            send_frames_surface_tree(
-                surface,
-                &self.output,
-                stamp,
-                Some(Duration::ZERO),
-                |_, _| Some(self.output.clone()),
-            );
-        }
     }
 
-    fn cover_desktop(&mut self) {
-        self.lock.phase = LockPhase::Covering;
-        self.lock.covered_at = None;
-        self.lock.unlocked_at = None;
-        if self.overview.open {
-            self.toggle_overview();
-        }
-        self.status_panel = Panel::Closed;
-        self.dock_pressed = None;
-        self.status_pressed = None;
-        self.dragged_window = None;
-        self.finish_resize();
-        let keyboard = self.keyboard.clone();
-        keyboard.unset_grab(self);
-        self.focus_window(None);
-        let pointer = self.pointer.clone();
-        let serial = SERIAL_COUNTER.next_serial();
-        pointer.motion(
-            self,
-            None,
-            &MotionEvent {
-                location: pointer.current_location(),
-                serial,
-                time: 0,
-            },
-        );
-        pointer.unset_grab(self, serial, 0);
-        pointer.frame(self);
+    fn unlock_session(&mut self) {
+        self.lock.active = false;
+        self.lock.unlocked_at = Some(Instant::now());
+        self.lock.show_sign_in(false, Instant::now(), true);
+        self.focus_last_window();
         self.redraw = true;
     }
 }
-
-impl SessionLockHandler for State {
-    fn lock_state(&mut self) -> &mut SessionLockManagerState {
-        &mut self.lock.manager
-    }
-
-    fn lock(&mut self, confirmation: SessionLocker) {
-        if self.native_session
-            && self.lock_active()
-            && self.lock.child.is_some()
-            && self.lock_surface().is_none()
-            && self.lock.pending.is_none()
-        {
-            self.lock.phase = LockPhase::Covering;
-            self.lock.pending = Some(confirmation);
-            self.redraw = true;
-        }
-    }
-
-    fn unlock(&mut self) {
-        if self.lock.phase == LockPhase::Covered && self.lock.pending.is_none() {
-            self.lock.phase = LockPhase::Desktop;
-            self.lock.unlocked_at = Some(Instant::now());
-            self.lock.surface = None;
-            self.lock.suspend_pending = false;
-            if self.status_error.is_some() {
-                self.status_panel = Panel::Settings;
-            }
-            self.focus_last_window();
-            self.redraw = true;
-        }
-    }
-
-    fn new_surface(&mut self, surface: LockSurface, output: WlOutput) {
-        if self.output.owns(&output) && self.lock_active() {
-            if let Some(mode) = self.output.current_mode() {
-                // Smithay sends the initial configure after this hook returns.
-                surface.with_pending_state(|state| {
-                    state.size = Some((mode.size.w as u32, mode.size.h as u32).into())
-                });
-            }
-            self.lock.surface = Some(surface);
-            self.redraw = true;
-        }
-    }
-}
-
-delegate_session_lock!(State);
 
 #[cfg(test)]
 mod tests {

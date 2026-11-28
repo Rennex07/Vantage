@@ -1,6 +1,7 @@
 mod console;
 mod desktop;
 mod frame_metrics;
+mod lock_auth;
 mod native;
 mod nested;
 mod session;
@@ -32,6 +33,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     match backend.as_deref().and_then(std::ffi::OsStr::to_str) {
         Some("--tty") => native::run(),
+        Some("--authenticate-lock") => std::process::exit(lock_auth::run_helper()),
         Some("--console") => std::process::exit(i32::from(console::run(false).get())),
         Some("--files") => {
             let code = match shell::launch::run_files() {

@@ -156,12 +156,12 @@ fn apply_theme(terminal: &Terminal, style: &gtk::CssProvider, theme: Theme, netw
     style.load_from_string(&format!(
         "window, scrolledwindow {{ background: {base}; color: {text}; }}
          headerbar {{ min-height: 42px; padding: 0 8px; font-family: Roboto, sans-serif;
-                      background: linear-gradient({raised}, {surface}); color: {text};
-                      border-bottom: 1px solid {selected}; box-shadow: none; }}
+                      background: linear-gradient(shade({raised}, 1.16), {surface}); color: {text};
+                      border-bottom: 1px solid {selected}; box-shadow: inset 0 2px alpha(white, 0.45); }}
          .console-title {{ font-weight: 900; }}
          .console-mark {{ font-family: monospace; font-weight: bold; font-size: 14px;
                           color: {text}; background: {selected}; border-radius: 8px;
-                          min-width: 26px; margin: 7px 4px; }}
+                          min-width: 26px; margin: 7px 4px; box-shadow: inset 0 1px alpha(white, 0.45); }}
          headerbar button {{ color: {text}; }}
          headerbar button:hover {{ background: {selected}; }}
          scrollbar slider {{ background: {muted}; min-width: 5px; }}"

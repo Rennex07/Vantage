@@ -14,7 +14,8 @@ use crate::desktop::Tool;
 use super::{theme, workspaces::WORKSPACE_COUNT};
 
 pub const BAR_HEIGHT: f64 = 42.0;
-const PANEL: (i32, i32) = (312, 294);
+const PANEL_WIDTH: i32 = 312;
+const PANEL_RADIUS: f32 = 22.0;
 const FIRST_ROW: f64 = 43.0;
 const ROW_HEIGHT: f64 = 43.0;
 const WORKSPACE_X: f64 = 177.0;
@@ -30,7 +31,6 @@ pub enum Action {
     Launch(Tool),
     Power,
     Lock,
-    Suspend,
     Shutdown,
     Logout,
     Cancel,
@@ -49,6 +49,10 @@ pub enum Panel {
 impl Panel {
     pub fn open(self) -> bool {
         self != Self::Closed
+    }
+
+    fn size(self) -> (i32, i32) {
+        (PANEL_WIDTH, if self == Self::Settings { 294 } else { 202 })
     }
 }
 
@@ -213,8 +217,9 @@ impl StatusBar {
             .as_ref()
             .is_some_and(|(old_view, _)| old_view == view)
         {
-            let texture =
-                theme::texture(renderer, PANEL.into(), |context| paint_panel(context, view))?;
+            let texture = theme::texture(renderer, view.panel.size().into(), |context| {
+                paint_panel(context, view)
+            })?;
             self.panel = Some((view.clone(), texture));
         }
         Ok(&self.panel.as_ref().expect("settings panel was rendered").1)
@@ -229,16 +234,22 @@ pub fn bounds(width: i32, scale: f64) -> Rectangle<i32, Physical> {
 pub fn panel_bounds(
     output: Size<i32, Physical>,
     bar: Rectangle<i32, Physical>,
+    panel: Panel,
 ) -> Rectangle<i32, Physical> {
+    let (panel_w, panel_h) = panel.size();
     let scale = (f64::from(bar.size.h) / BAR_HEIGHT)
-        .min(f64::from(output.w - 16) / f64::from(PANEL.0))
-        .min(f64::from(output.h - bar.size.h - 16) / f64::from(PANEL.1));
-    let width = ((f64::from(PANEL.0) * scale).round() as i32).max(1);
-    let height = ((f64::from(PANEL.1) * scale).round() as i32).max(1);
+        .min(f64::from(output.w - 16) / f64::from(panel_w))
+        .min(f64::from(output.h - bar.size.h - 16) / f64::from(panel_h));
+    let width = ((f64::from(panel_w) * scale).round() as i32).max(1);
+    let height = ((f64::from(panel_h) * scale).round() as i32).max(1);
     Rectangle::new(
         (output.w - width - 8, bar.size.h + 8).into(),
         (width, height).into(),
     )
+}
+
+pub fn panel_radius(bounds: Rectangle<i32, Physical>) -> f32 {
+    PANEL_RADIUS * bounds.size.w as f32 / PANEL_WIDTH as f32
 }
 
 fn workspaces_fit(width: f64) -> bool {
@@ -278,8 +289,9 @@ pub fn action_at(
                 .map(Action::Workspace);
         }
     } else if panel.open() && popup.to_f64().to_logical(1.0).contains(point) {
-        let x = (point.x - f64::from(popup.loc.x)) * f64::from(PANEL.0) / f64::from(popup.size.w);
-        let y = (point.y - f64::from(popup.loc.y)) * f64::from(PANEL.1) / f64::from(popup.size.h);
+        let (panel_w, panel_h) = panel.size();
+        let x = (point.x - f64::from(popup.loc.x)) * f64::from(panel_w) / f64::from(popup.size.w);
+        let y = (point.y - f64::from(popup.loc.y)) * f64::from(panel_h) / f64::from(popup.size.h);
         if (12.0..300.0).contains(&x) {
             let offset = y - FIRST_ROW;
             if matches!(panel, Panel::Logout | Panel::Shutdown) {
@@ -296,10 +308,8 @@ pub fn action_at(
             if offset >= 0.0 && offset % ROW_HEIGHT < 37.0 {
                 return match (panel, (offset / ROW_HEIGHT) as usize) {
                     (Panel::Power, 0) if native => Some(Action::Lock),
-                    (Panel::Power, 1) if native => Some(Action::Suspend),
-                    (Panel::Power, 2) if native => Some(Action::Shutdown),
-                    (Panel::Power, 3) if native => Some(Action::Logout),
-                    (Panel::Power, 4) if native => Some(Action::Cancel),
+                    (Panel::Power, 1) if native => Some(Action::Shutdown),
+                    (Panel::Power, 2) if native => Some(Action::Cancel),
                     (Panel::Settings, 0) => Some(Action::Launch(Tool::Network)),
                     (Panel::Settings, 1) => Some(Action::Launch(Tool::Bluetooth)),
                     (Panel::Settings, 2) => Some(Action::Launch(Tool::Sound)),
@@ -319,14 +329,10 @@ fn paint(context: &Context, size: Size<i32, Physical>, view: &View) -> Result<()
     let width = f64::from(size.w) / scale;
     context.scale(scale, scale);
     let shade = LinearGradient::new(0.0, 0.0, 0.0, BAR_HEIGHT);
-    shade.add_color_stop_rgba(
-        0.0,
-        colors.surface.0,
-        colors.surface.1,
-        colors.surface.2,
-        1.0,
-    );
-    shade.add_color_stop_rgba(1.0, colors.base.0, colors.base.1, colors.base.2, 1.0);
+    let tint = crate::palette::mix(colors.surface, colors.accent, 0.17);
+    let opacity = if view.solid { 1.0 } else { 0.91 };
+    shade.add_color_stop_rgba(0.0, tint.0, tint.1, tint.2, opacity);
+    shade.add_color_stop_rgba(1.0, colors.base.0, colors.base.1, colors.base.2, opacity);
     context.set_source(shade)?;
     context.paint()?;
     theme::ink(context, colors.accent, 0.26);
@@ -565,9 +571,10 @@ fn panel_row(
     detail: &str,
 ) -> Result<(), CairoError> {
     let colors = view.theme.colors();
-    theme::rounded(context, (12.0, y, 288.0, 37.0), 9.0);
-    theme::ink(
+    theme::glass_surface(
         context,
+        (12.0, y, 288.0, 37.0),
+        14.0,
         if view.hovered == Some(action) {
             colors.raised
         } else {
@@ -578,10 +585,9 @@ fn panel_row(
         } else if view.hovered == Some(action) {
             0.77
         } else {
-            0.43
+            0.65
         },
-    );
-    context.fill()?;
+    )?;
     theme::font(context, 12.0, FontWeight::Bold);
     theme::ink(context, colors.text, 1.0);
     context.move_to(24.0, y + 23.0);
@@ -594,12 +600,13 @@ fn panel_row(
 
 fn paint_panel(context: &Context, view: &View) -> Result<(), CairoError> {
     let colors = view.theme.colors();
-    theme::palette_card(
+    let (width, height) = view.panel.size();
+    theme::glass_surface(
         context,
-        (f64::from(PANEL.0), f64::from(PANEL.1)),
-        15.0,
-        colors,
-        if view.solid { 1.0 } else { 0.20 },
+        (1.0, 1.0, f64::from(width - 2), f64::from(height - 2)),
+        f64::from(PANEL_RADIUS),
+        colors.base,
+        if view.solid { 1.0 } else { 0.16 },
     )?;
     theme::font(context, 16.0, FontWeight::Bold);
     theme::ink(context, colors.text, 1.0);
@@ -636,10 +643,8 @@ fn paint_panel(context: &Context, view: &View) -> Result<(), CairoError> {
     if view.panel == Panel::Power {
         context.show_text("Power")?;
         for (index, (action, label, detail)) in [
-            (Action::Lock, "Lock screen", "Super+L"),
-            (Action::Suspend, "Suspend", "Lock first"),
+            (Action::Lock, "Lock screen", "F9"),
             (Action::Shutdown, "Shut down", "Power off"),
-            (Action::Logout, "Log out", "Return to sign-in"),
             (Action::Cancel, "Back", "Quick settings"),
         ]
         .into_iter()
@@ -657,7 +662,7 @@ fn paint_panel(context: &Context, view: &View) -> Result<(), CairoError> {
         if let Some(error) = view.error {
             theme::font(context, 11.0, FontWeight::Normal);
             theme::ink(context, colors.warning, 1.0);
-            context.move_to(17.0, 278.0);
+            context.move_to(17.0, 190.0);
             context.show_text(error)?;
         }
         return Ok(());
@@ -688,7 +693,7 @@ fn paint_panel(context: &Context, view: &View) -> Result<(), CairoError> {
             FIRST_ROW + 4.0 * ROW_HEIGHT,
             Action::Power,
             "Power",
-            "Lock, suspend or shut down",
+            "Lock or shut down",
         )?;
     }
     theme::font(context, 11.0, FontWeight::Normal);
@@ -722,10 +727,47 @@ mod tests {
     use super::*;
 
     #[test]
+    fn power_panel_and_shutdown_confirmation_use_visible_rows() {
+        let bar = bounds(1280, 1.0);
+        let popup = panel_bounds((1280, 720).into(), bar, Panel::Power);
+        let hits = (bar, popup);
+        let point = |y: f64| {
+            (
+                f64::from(popup.loc.x) + 20.0 * f64::from(popup.size.w) / f64::from(PANEL_WIDTH),
+                f64::from(popup.loc.y)
+                    + y * f64::from(popup.size.h) / f64::from(Panel::Power.size().1),
+            )
+                .into()
+        };
+        assert_eq!(
+            action_at(hits, point(50.0), Panel::Power, true),
+            Some(Action::Lock)
+        );
+        assert_eq!(
+            action_at(hits, point(93.0), Panel::Power, true),
+            Some(Action::Shutdown)
+        );
+        assert_eq!(
+            action_at(hits, point(136.0), Panel::Power, true),
+            Some(Action::Cancel)
+        );
+        assert_eq!(action_at(hits, point(179.0), Panel::Power, true), None);
+        assert_eq!(
+            action_at(hits, point(110.0), Panel::Shutdown, true),
+            Some(Action::Shutdown)
+        );
+        assert_eq!(
+            action_at(hits, point(160.0), Panel::Shutdown, true),
+            Some(Action::Cancel)
+        );
+        assert_eq!(action_at(hits, point(50.0), Panel::Power, false), None);
+    }
+
+    #[test]
     fn top_bar_workspaces_and_quick_settings_use_visible_bounds() {
         let output = (1280, 720).into();
         let bar = bounds(1280, 1.5);
-        let popup = panel_bounds(output, bar);
+        let popup = panel_bounds(output, bar, Panel::Settings);
         let hits = (bar, popup);
         let network = (f64::from(popup.loc.x) + 30.0, f64::from(popup.loc.y) + 82.0).into();
         let power = (

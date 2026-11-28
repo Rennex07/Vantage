@@ -50,7 +50,6 @@ pub use windows::WindowScene;
 #[derive(Default)]
 pub struct ClientState {
     compositor: CompositorClientState,
-    locker: bool,
 }
 
 impl ClientData for ClientState {}
@@ -158,7 +157,7 @@ impl State {
             status_pressed: None,
             status_error: None,
             native_session: false,
-            lock: lock::Lock::new(display),
+            lock: lock::Lock::new(),
             status_hits: None,
             host_focused: true,
             workspaces: Workspaces::default(),
@@ -366,7 +365,6 @@ impl State {
             self.output.delete_mode(previous);
         }
         self.center_windows();
-        self.configure_locker();
     }
 }
 
@@ -390,9 +388,6 @@ impl CompositorHandler for State {
 
     fn commit(&mut self, surface: &WlSurface) {
         smithay::backend::renderer::utils::on_commit_buffer_handler::<Self>(surface);
-        if self.lock_surface() == Some(surface) {
-            self.update_lock_focus();
-        }
         self.surface_committed(surface);
     }
 }
