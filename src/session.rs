@@ -166,6 +166,13 @@ pub struct Scene {
     notice: Option<(String, &'static str, GlesTexture)>,
     notification_panel: Option<(u64, usize, crate::palette::Theme, GlesTexture)>,
     notification_banner: Option<(u64, crate::palette::Theme, GlesTexture)>,
+    dock_menu_texture: Option<(
+        Vec<String>,
+        crate::palette::Theme,
+        Size<i32, Physical>,
+        Option<usize>,
+        GlesTexture,
+    )>,
     label_theme: crate::palette::Theme,
     previous_bar: Option<(Size<i32, Physical>, GlesTexture)>,
     overview_labels: std::collections::HashMap<String, GlesTexture>,
@@ -207,6 +214,7 @@ impl Scene {
             notice: None,
             notification_panel: None,
             notification_banner: None,
+            dock_menu_texture: None,
             label_theme: Default::default(),
             previous_bar: None,
             overview_labels: Default::default(),
@@ -552,8 +560,9 @@ impl Scene {
                     state.notification_page = page;
                     state.notification_hits.rows = center
                         .visible(page)
-                        .map(|entry| (entry.id, entry.actions.len()))
+                        .map(|entry| (entry.id, entry.actions.len(), !entry.app.is_empty()))
                         .collect();
+                    state.notification_hits.any_muted = center.any_muted();
                     state.notification_hits.revision = revision;
                     state.notification_hits.page = page;
                     state.notification_hits.pages = pages;
@@ -628,6 +637,9 @@ impl Scene {
             } else {
                 Vec::new()
             };
+        if fullscreen || unlocking > 0.0 || overview > 0.0 {
+            state.dock_menu = None;
+        }
         let (overview_cards, selected) = state.overview_cards();
         if overview > 0.0 {
             let style = (
@@ -673,6 +685,37 @@ impl Scene {
         } else {
             None
         };
+        if let Some(menu) = &state.dock_menu {
+            let labels = menu.labels();
+            let hovered = menu.hit(state.pointer_location());
+            let colors = state.appearance.theme;
+            if self
+                .dock_menu_texture
+                .as_ref()
+                .is_none_or(|(old, theme, size, hover, _)| {
+                    *old != labels
+                        || *theme != colors
+                        || *size != menu.bounds.size
+                        || *hover != hovered
+                })
+            {
+                self.dock_menu_texture = Some((
+                    labels.clone(),
+                    colors,
+                    menu.bounds.size,
+                    hovered,
+                    crate::shell::dock_menu::texture(
+                        renderer,
+                        colors,
+                        menu.bounds.size,
+                        &labels,
+                        hovered,
+                    )?,
+                ));
+            }
+        } else {
+            self.dock_menu_texture = None;
+        }
         let mut frame = renderer.render(target, size, transform)?;
         if fullscreen {
             frame.clear([0.0, 0.0, 0.0, 1.0].into(), &[bounds])?;
@@ -850,7 +893,8 @@ impl Scene {
                 (width, texture.size().h).into(),
             );
             draw_texture(&mut frame, texture, rect, bounds)?;
-        } else if state.dock_pressed.is_none()
+        } else if state.dock_menu.is_none()
+            && state.dock_pressed.is_none()
             && !state.shell_is_animating()
             && !state.windows_are_opening()
             && let Some(dock) = &state.dock_hits
@@ -868,6 +912,11 @@ impl Scene {
                 (texture.size().w, texture.size().h).into(),
             );
             draw_texture(&mut frame, texture, rect, bounds)?;
+        }
+        if let Some(menu) = &state.dock_menu
+            && let Some((_, _, _, _, texture)) = &self.dock_menu_texture
+        {
+            draw_texture(&mut frame, texture, menu.bounds, bounds)?;
         }
         if let Some(sign) = unlock_sign {
             let shade = unlocking * (1.0 - lock_wallpaper * 0.8);

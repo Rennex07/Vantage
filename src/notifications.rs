@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashSet, VecDeque},
     time::{Duration, Instant},
 };
 
@@ -44,6 +44,7 @@ pub struct Center {
     revision: u64,
     private: bool,
     quiet: bool,
+    muted_apps: HashSet<String>,
     banner: Option<(u32, Instant)>,
     events: Vec<Event>,
 }
@@ -103,12 +104,18 @@ impl Center {
         }
         if !self.private
             && !self.quiet
+            && !self
+                .entries
+                .iter()
+                .any(|entry| entry.id == id && self.app_muted(&entry.app))
             && (replacement.is_none() || self.banner.is_some_and(|(shown, _)| shown == id))
         {
             let visible_for = timeout
                 .unwrap_or(Duration::from_secs(5))
                 .min(Duration::from_secs(8));
             self.banner = Some((id, now + visible_for));
+        } else if self.banner.is_some_and(|(shown, _)| shown == id) {
+            self.banner = None;
         }
         self.changed();
         id
@@ -225,15 +232,67 @@ impl Center {
         self.quiet
     }
 
+    // Client-supplied display labels are not authenticated identities.
+    // Muting is a session-only presentation preference.
+    pub fn app_muted(&self, app: &str) -> bool {
+        self.muted_apps.contains(app)
+    }
+    pub fn any_muted(&self) -> bool {
+        !self.muted_apps.is_empty()
+    }
+    pub fn toggle_app(&mut self, id: u32) {
+        if self.private {
+            return;
+        }
+        let Some(app) = self
+            .entries
+            .iter()
+            .find(|entry| entry.id == id)
+            .map(|entry| entry.app.clone())
+        else {
+            return;
+        };
+        if app.is_empty() {
+            return;
+        }
+        if !self.muted_apps.remove(&app) {
+            if self.muted_apps.len() >= HISTORY_LIMIT {
+                return;
+            }
+            self.muted_apps.insert(app.clone());
+            if self.banner().is_some_and(|entry| entry.app == app) {
+                self.banner = None;
+            }
+        }
+        self.changed();
+    }
+    pub fn unmute_all(&mut self) {
+        if !self.private && self.any_muted() {
+            self.muted_apps.clear();
+            self.changed();
+        }
+    }
+
     pub fn pages(&self) -> usize {
         self.entries.len().div_ceil(VISIBLE_ROWS).max(1)
     }
 
     pub fn visible(&self, page: usize) -> impl Iterator<Item = &Entry> {
-        self.entries
-            .iter()
+        let mut grouped = Vec::new();
+        if !self.private {
+            let mut seen = HashSet::new();
+            for entry in &self.entries {
+                if entry.app.is_empty() {
+                    grouped.push(entry);
+                } else if seen.insert(entry.app.as_str()) {
+                    grouped.extend(self.entries.iter().filter(|other| other.app == entry.app));
+                }
+            }
+        }
+        grouped
+            .into_iter()
             .skip(page * VISIBLE_ROWS)
-            .take(if self.private { 0 } else { VISIBLE_ROWS })
+            .take(VISIBLE_ROWS)
     }
 
     pub fn banner(&self) -> Option<&Entry> {
@@ -316,6 +375,36 @@ mod tests {
         center.set_private(false);
         assert_eq!(center.visible(0).count(), 2);
         assert!(center.banner().is_none());
+    }
+
+    #[test]
+    fn grouping_and_session_mute_preserve_history_and_privacy() {
+        let now = Instant::now();
+        let mut center = Center::default();
+        let first = center.notify(":1.1", request(0, 0), now);
+        let mut other = request(0, 0);
+        other.app = "Other".into();
+        let second = center.notify(":1.2", other, now);
+        let third = center.notify(":1.1", request(0, 0), now);
+        assert_eq!(
+            center.visible(0).map(|e| e.id).collect::<Vec<_>>(),
+            vec![third, first, second]
+        );
+        center.toggle_app(third);
+        assert!(center.app_muted("Test"));
+        assert!(center.banner().is_none());
+        let fourth = center.notify(":1.1", request(0, 0), now);
+        assert!(center.banner().is_none());
+        assert_eq!(center.visible(0).next().unwrap().id, fourth);
+        center.set_private(true);
+        center.unmute_all();
+        center.toggle_app(third);
+        assert!(center.app_muted("Test"));
+        center.set_private(false);
+        center.unmute_all();
+        assert!(!center.any_muted());
+        center.notify(":1.1", request(0, 0), now);
+        assert!(center.banner().is_some());
     }
 
     #[test]

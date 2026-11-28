@@ -27,6 +27,7 @@ use crate::shell::{
     launch::{App, Target},
     motion::{Opening, Pose},
     status::BAR_HEIGHT,
+    timeline::{Animation, Ease},
 };
 
 use super::{State, input::BUTTON_LEFT};
@@ -106,6 +107,7 @@ impl State {
                 self.focus_window(Some(&window));
             }
         } else if !was_empty && is_empty {
+            self.minimize_motion.retain(|(other, _)| other != &window);
             self.minimized_windows.retain(|other| other != &window);
             self.forget_window_geometry(&window);
             self.opening_windows.retain(|(other, _)| other != &window);
@@ -145,6 +147,9 @@ impl State {
 
     pub(super) fn focus_window(&mut self, target: Option<&Window>) {
         if let Some(window) = target {
+            if self.minimized_windows.contains(window) {
+                self.animate_minimize(window, false);
+            }
             self.minimized_windows.retain(|other| other != window);
             self.spaces[self.workspaces.active].raise_element(window, true);
         }
@@ -196,11 +201,48 @@ impl State {
             return;
         }
         let focused = self.focused_window().as_ref() == Some(&window);
+        self.animate_minimize(&window, true);
         self.minimized_windows.push(window);
         if focused {
             self.focus_last_window();
         }
         self.redraw = true;
+    }
+
+    fn animate_minimize(&mut self, window: &Window, minimized: bool) {
+        if self.appearance.reduce_motion
+            || self.overview.open
+            || self.lock_active()
+            || geometry::is_fullscreen(window)
+            || self
+                .opening_windows
+                .iter()
+                .any(|(other, _)| other == window)
+        {
+            self.minimize_motion.retain(|(other, _)| other != window);
+            return;
+        }
+        let now = Instant::now();
+        let target = f64::from(minimized);
+        if let Some((_, track)) = self
+            .minimize_motion
+            .iter_mut()
+            .find(|(other, _)| other == window)
+        {
+            track.retarget(target, now, Duration::from_millis(180), Ease::Out);
+        } else {
+            let mut track = Animation::default();
+            track.retarget(1.0 - target, now, Duration::ZERO, Ease::Out);
+            track.retarget(target, now, Duration::from_millis(180), Ease::Out);
+            self.minimize_motion.push((window.clone(), track));
+        }
+    }
+
+    fn minimizing_amount(&self, window: &Window, now: Instant) -> Option<f64> {
+        self.minimize_motion
+            .iter()
+            .find(|(other, _)| other == window)
+            .map(|(_, track)| track.value(now))
     }
 
     pub(super) fn close_focused_window(&self) {
@@ -240,20 +282,104 @@ impl State {
         self.dock_target(&self.focused_window()?)
     }
 
+    pub(super) fn open_dock_menu(&mut self, point: Point<f64, Logical>) -> bool {
+        let Some(dock) = &self.dock_hits else {
+            return false;
+        };
+        let Some(crate::shell::dock::Action::Launch(target)) = dock.action_at(point) else {
+            return false;
+        };
+        let Some(slot) = dock.slot_at(point) else {
+            return false;
+        };
+        let Some(mode) = self.output.current_mode() else {
+            return false;
+        };
+        let target = target.clone();
+        let limit = ((mode.size.h - 100) / 34).clamp(0, 8) as usize;
+        let windows = self.spaces.iter().enumerate().flat_map(|(index, space)| space.elements().rev().map(move |window| (index, window)))
+            .filter(|(_, window)| !window.bbox().size.is_empty() && self.dock_target(window).as_ref() == Some(&target))
+            .take(limit)
+            .map(|(index, window)| {
+                let title: String = window.toplevel().map_or_else(String::new, |top| with_states(top.wl_surface(), |state| {
+                    state.data_map.get::<XdgToplevelSurfaceData>().and_then(|entry| {
+                        let entry = entry.lock().ok()?;
+                        entry.title.as_ref().or(entry.app_id.as_ref()).map(|text| text.chars().filter(|c| !c.is_control() && !matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')).take(80).collect())
+                    }).unwrap_or_default()
+                }));
+                let minimized = if self.minimized_windows.contains(window) { " (minimized)" } else { "" };
+                (window.clone(), format!("{}: {}{}", index + 1, if title.is_empty() { "Window" } else { &title }, minimized))
+            }).collect();
+        self.dock_menu = crate::shell::dock_menu::Menu::new(
+            target,
+            windows,
+            dock.anchor(slot),
+            dock.top(),
+            mode.size,
+        );
+        self.status_panel = crate::shell::status::Panel::Closed;
+        self.redraw = true;
+        self.dock_menu.is_some()
+    }
+
+    pub(super) fn choose_dock_menu(
+        &mut self,
+        menu: crate::shell::dock_menu::Menu,
+        row: usize,
+        open: impl FnOnce(Target, Instant) -> std::io::Result<()>,
+    ) {
+        if let Some((window, _)) = menu.windows.get(row) {
+            let workspace = self
+                .spaces
+                .iter()
+                .position(|space| space.element_location(window).is_some());
+            if let Some(workspace) = workspace
+                && !window.bbox().size.is_empty()
+            {
+                self.select_workspace(workspace);
+                self.focus_window(Some(window));
+            }
+        } else if row == menu.windows.len() {
+            self.focus_dock_window(&menu.target);
+        } else if row == menu.windows.len() + 1 {
+            if let Err(error) = open(menu.target, Instant::now()) {
+                eprintln!("Could not open new window: {error}");
+                self.show_notice("Application".into(), "The app could not be started.");
+            }
+        }
+        self.redraw = true;
+    }
+
     pub(super) fn focus_dock_window(&mut self, target: &Target) -> bool {
         let active = self.workspaces.active;
-        let found = std::iter::once(active)
+        let candidates: Vec<_> = std::iter::once(active)
             .chain((0..self.spaces.len()).filter(|&index| index != active))
-            .find_map(|index| {
+            .flat_map(|index| {
                 self.spaces[index]
                     .elements()
                     .rev()
-                    .find(|window| {
-                        !window.bbox().size.is_empty()
-                            && self.dock_target(window).as_ref() == Some(target)
-                    })
-                    .map(|window| (index, window.clone()))
-            });
+                    .map(move |window| (index, window))
+            })
+            .filter(|(_, window)| {
+                !window.bbox().size.is_empty() && self.dock_target(window).as_ref() == Some(target)
+            })
+            .map(|(index, window)| (index, window.clone()))
+            .collect();
+        let focused = self.focused_window();
+        let ordered: Vec<_> = candidates
+            .iter()
+            .map(|(_, window)| window.clone())
+            .collect();
+        let selected = crate::shell::app_identity::cycle_window(
+            &mut self.dock_cycle,
+            &ordered,
+            focused.as_ref(),
+        );
+        let found = selected.and_then(|selected| {
+            candidates
+                .into_iter()
+                .find(|(_, window)| *window == selected)
+        });
         if let Some((workspace, window)) = found {
             if self.overview.open {
                 self.toggle_overview();
@@ -348,14 +474,19 @@ impl State {
                     continue;
                 }
                 let minimized = self.minimized_windows.contains(window);
-                if minimized && (index != self.workspaces.active || overview == 0.0) {
+                let minimizing = overview == 0.0
+                    && self
+                        .minimizing_amount(window, now)
+                        .is_some_and(|amount| amount < 1.0);
+                if minimized && !minimizing && (index != self.workspaces.active || overview == 0.0)
+                {
                     continue;
                 }
                 let Some(target) = self.window_target(space, window, offset) else {
                     continue;
                 };
                 let mut pose = self.window_pose(window, target, now);
-                if minimized {
+                if minimized && overview > 0.0 {
                     pose.opacity *= overview as f32;
                 }
                 if overview > 0.0
@@ -423,12 +554,16 @@ impl State {
     }
 
     pub fn windows_are_opening(&self) -> bool {
-        !self.opening_windows.is_empty()
+        !self.opening_windows.is_empty() || !self.minimize_motion.is_empty()
     }
 
     pub fn finish_window_openings(&mut self, now: Instant) {
         self.opening_windows
             .retain(|(_, opening)| opening.active(now));
+        self.minimize_motion.retain_mut(|(_, track)| {
+            track.finish_frame(now);
+            track.is_animating()
+        });
     }
 
     pub fn opening_tiles(
@@ -469,7 +604,8 @@ impl State {
     }
 
     fn window_pose(&self, window: &Window, rect: Rectangle<f64, Logical>, now: Instant) -> Pose {
-        self.opening_windows
+        let mut pose = self
+            .opening_windows
             .iter()
             .find(|(opening, _)| opening == window)
             .map_or(
@@ -479,7 +615,21 @@ impl State {
                     card: None,
                 },
                 |(_, opening)| opening.pose(now, rect),
-            )
+            );
+        if self.overview.amount(now) == 0.0
+            && let Some(amount) = self.minimizing_amount(window, now)
+        {
+            let shrink = 1.0 - 0.18 * amount;
+            let size = pose.rect.size.upscale(shrink);
+            pose.rect.loc += Point::from((
+                (pose.rect.size.w - size.w) / 2.0,
+                (pose.rect.size.h - size.h) / 2.0 + 36.0 * amount,
+            ));
+            pose.rect.size = size;
+            pose.opacity *= (1.0 - amount) as f32;
+            pose.card = None;
+        }
+        pose
     }
 
     fn workspace_offset(&self, index: usize, position: f64) -> Point<i32, Logical> {
@@ -521,7 +671,10 @@ impl State {
             for window in space.elements_for_output(&self.output) {
                 if fullscreen.is_some_and(|top| top != window)
                     || (self.minimized_windows.contains(window)
-                        && self.overview.amount(time) == 0.0)
+                        && self.overview.amount(time) == 0.0
+                        && !self
+                            .minimizing_amount(window, time)
+                            .is_some_and(|amount| amount < 1.0))
                 {
                     continue;
                 }
@@ -748,6 +901,8 @@ impl XdgShellHandler for State {
         if let Some((index, window)) = self.find_window(surface.wl_surface()) {
             let focused = self.keyboard.current_focus().as_ref() == Some(surface.wl_surface());
             self.spaces[index].unmap_elem(&window);
+            self.dock_cycle.retain(|other| other != &window);
+            self.minimize_motion.retain(|(other, _)| other != &window);
             self.minimized_windows.retain(|other| other != &window);
             self.forget_window_geometry(&window);
             self.opening_windows

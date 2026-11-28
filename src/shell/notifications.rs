@@ -21,11 +21,13 @@ const QUIET: (f64, f64, f64, f64) = (138.0, 13.0, 116.0, 32.0);
 const CLEAR: (f64, f64, f64, f64) = (262.0, 13.0, 65.0, 32.0);
 const NEWER: (f64, f64, f64, f64) = (16.0, 322.0, 72.0, 26.0);
 const OLDER: (f64, f64, f64, f64) = (254.0, 322.0, 72.0, 26.0);
+const UNMUTE: (f64, f64, f64, f64) = (100.0, 322.0, 142.0, 26.0);
 
 #[derive(Default)]
 pub struct Hits {
     pub banner: Option<Rectangle<i32, Physical>>,
-    pub rows: Vec<(u32, usize)>,
+    pub rows: Vec<(u32, usize, bool)>,
+    pub any_muted: bool,
     pub revision: u64,
     pub page: usize,
     pub pages: usize,
@@ -61,14 +63,20 @@ impl Hits {
         if self.page + 1 < self.pages && contains(OLDER) {
             return Some(Action::NotificationPage(1));
         }
+        if self.any_muted && contains(UNMUTE) {
+            return Some(Action::NotificationUnmuteAll);
+        }
         if y < FIRST_ROW {
             return None;
         }
         let row = ((y - FIRST_ROW) / ROW_HEIGHT) as usize;
-        let (id, actions) = *self.rows.get(row)?;
+        let (id, actions, can_mute) = *self.rows.get(row)?;
         let y = y - row as f64 * ROW_HEIGHT - FIRST_ROW;
         if (296.0..326.0).contains(&x) && (1.0..32.0).contains(&y) {
             return Some(Action::NotificationDismiss(id));
+        }
+        if can_mute && (232.0..292.0).contains(&x) && (1.0..32.0).contains(&y) {
+            return Some(Action::NotificationMute(id, self.revision));
         }
         if (38.0..60.0).contains(&y) && (18.0..292.0).contains(&x) && actions > 0 {
             let action = usize::from(x >= 156.0 && actions > 1);
@@ -115,7 +123,7 @@ pub fn panel(
                 colors,
                 &entry.summary,
                 (19.0, y + 17.0),
-                270.0,
+                205.0,
                 true,
             )?;
             let detail = if entry.app.is_empty() {
@@ -127,6 +135,18 @@ pub fn panel(
             };
             text(context, colors, &detail, (19.0, y + 34.0), 302.0, false)?;
             button(context, colors, (296.0, y + 1.0, 30.0, 30.0), "×")?;
+            if !entry.app.is_empty() {
+                button(
+                    context,
+                    colors,
+                    (232.0, y + 1.0, 60.0, 30.0),
+                    if center.app_muted(&entry.app) {
+                        "Unmute"
+                    } else {
+                        "Mute"
+                    },
+                )?;
+            }
             for (index, action) in entry.actions.iter().take(2).enumerate() {
                 let x = 18.0 + 138.0 * index as f64;
                 button(
@@ -145,6 +165,9 @@ pub fn panel(
                     &action.label,
                 )?;
             }
+        }
+        if center.any_muted() {
+            button(context, colors, UNMUTE, "Unmute all")?;
         }
         if page > 0 {
             button(context, colors, NEWER, "Newer")?;

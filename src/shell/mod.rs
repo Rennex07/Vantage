@@ -2,6 +2,7 @@ pub const CHROME_SCALE: f64 = 1.12;
 
 pub mod app_identity;
 pub mod dock;
+pub mod dock_menu;
 pub mod glass;
 pub mod launch;
 pub mod lockscreen;

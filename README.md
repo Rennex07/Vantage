@@ -136,9 +136,17 @@ The blur cache conservatively reuses a complete unchanged single-panel
 backdrop and invalidates on client commits, visual changes and lock transitions.
 
 The dock raises or restores matching windows across workspaces and shows which
-apps are running. Use **Applications** to pin and unpin apps. In the native
-session, open **Alerts** or press **Super+N** to review notifications. Do Not
-Disturb hides banners, and the notification center is private while locked.
+apps are running. Repeated clicks cycle matching windows. Right-click an app
+to select a window by title and workspace, cycle windows, or request a new
+window (application-dependent). The menu lists up to eight matching windows
+when space permits. Use **Applications** to pin and unpin apps. Minimize and
+restore use a reversible shrink/fade transition unless reduced motion,
+fullscreen, or another incompatible transition requires an immediate change.
+In the native session, open **Alerts** or press **Super+N** to review
+notifications grouped by app label. Mute suppresses banners for that label
+without deleting history; Unmute all clears these session-only preferences.
+Do Not Disturb hides banners, and the notification center is private while
+locked. App labels are client-supplied, not authenticated identities.
 
 Use **Ctrl+Alt+Esc** to open the logout confirmation, or **Ctrl+Alt+F1–F12**
 to switch virtual terminals. Console starts in your home directory and supports

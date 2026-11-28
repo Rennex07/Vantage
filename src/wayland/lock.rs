@@ -164,6 +164,10 @@ impl State {
         }
         self.status_panel = Panel::Closed;
         self.dock_pressed = None;
+        self.dock_menu = None;
+        self.minimize_motion.clear();
+        self.dock_menu_press = None;
+        self.dock_right_pressed = false;
         self.status_pressed = None;
         self.dragged_window = None;
         self.finish_resize();

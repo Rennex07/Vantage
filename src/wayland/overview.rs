@@ -153,6 +153,8 @@ impl State {
         self.switching_windows = false;
         self.status_panel = crate::shell::status::Panel::Closed;
         self.dock_pressed = None;
+        self.dock_menu = None;
+        self.minimize_motion.clear();
         self.dragged_window = None;
         self.finish_resize();
         if open {

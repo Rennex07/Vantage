@@ -63,11 +63,13 @@ pub struct State {
     output: Output,
     spaces: [Space<Window>; WORKSPACE_COUNT],
     opening_windows: Vec<(Window, Opening)>,
+    minimize_motion: Vec<(Window, crate::shell::timeline::Animation)>,
     dragged_window: Option<windows::WindowDrag>,
     resizing_window: Option<Window>,
     overview: overview::Overview,
     switching_windows: bool,
     minimized_windows: Vec<Window>,
+    dock_cycle: Vec<Window>,
     pending_launches: [Option<Launch>; App::ALL.len()],
     pending_desktop: std::collections::HashMap<String, (Instant, usize)>,
     installed_desktop_ids: std::collections::HashSet<String>,
@@ -100,6 +102,9 @@ pub struct State {
     pub dock_hits: Option<DockHits>,
     pub dock_reserve: i32,
     pub dock_pressed: Option<DockAction>,
+    pub dock_menu: Option<crate::shell::dock_menu::Menu>,
+    dock_menu_press: Option<Option<usize>>,
+    dock_right_pressed: bool,
     pub dock_pins: Vec<crate::preferences::DockPin>,
     pub status: Status,
     pub display_brightness: u8,
@@ -154,11 +159,13 @@ impl State {
         let mut state = Self {
             spaces,
             opening_windows: Vec::new(),
+            minimize_motion: Vec::new(),
             dragged_window: None,
             resizing_window: None,
             overview: overview::Overview::default(),
             switching_windows: false,
             minimized_windows: Vec::new(),
+            dock_cycle: Vec::new(),
             pending_launches: [None; App::ALL.len()],
             pending_desktop: Default::default(),
             installed_desktop_ids: launch::installed_desktop_ids(),
@@ -194,6 +201,9 @@ impl State {
             dock_hits: None,
             dock_reserve: crate::shell::dock::reserve(mode.size, 1.0, 0),
             dock_pressed: None,
+            dock_menu: None,
+            dock_menu_press: None,
+            dock_right_pressed: false,
             dock_pins: crate::preferences::dock_pins(),
             status: Status::read(),
             display_brightness: crate::preferences::brightness(),
@@ -365,6 +375,7 @@ impl State {
             self.installed_desktop_ids = launch::installed_desktop_ids();
             self.dock_hits = None;
             self.dock_pressed = None;
+            self.dock_menu = None;
             self.redraw = true;
         }
         let appearance = crate::preferences::appearance();
@@ -374,6 +385,7 @@ impl State {
                 self.workspaces.settle();
                 self.overview.settle();
                 self.opening_windows.clear();
+                self.minimize_motion.clear();
             }
             self.redraw = true;
         }
@@ -413,6 +425,7 @@ impl State {
         if previous == Some(mode) {
             return;
         }
+        self.dock_menu = None;
         self.output.set_preferred(mode);
         self.output
             .change_current_state(Some(mode), None, None, None);

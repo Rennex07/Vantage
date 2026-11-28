@@ -33,8 +33,8 @@ This is the current local working tree. The repository's published history and t
 | Area | Present today | Work the roadmap builds on |
 | --- | --- | --- |
 | Login and boot | LightDM session entry, libseat-backed native mode, Winit preview, opt-in Plymouth theme | Repeatable install, greeter polish, session service lifecycle and recovery. See [session/vantage.desktop](session/vantage.desktop) and [src/native.rs](src/native.rs). |
-| Shell | Pi 4 wordmark, three workspaces, time and status, app pinning and running indicators, notification banners and an in-memory center | Multi-window dock actions, identity edge cases, notification grouping and per-app policy, accessible overlays and gestural navigation. See [src/shell](src/shell). |
-| Motion and effects | Shared transition primitives, app opening and workspace animation, live overview, Gaussian frost and refraction, safe graphics fallback and CPU frame timing | Finish the animation catalog and geometry-based input, extend single-panel backdrop reuse to regional and multi-panel damage tracking, and validate presentation measurements. See [src/shell/motion.rs](src/shell/motion.rs) and [src/shell/glass.rs](src/shell/glass.rs). |
+| Shell | Pi 4 wordmark, three workspaces, time and status, app pinning and running indicators, notification banners and an in-memory center | Window cycling, title/workspace context menus and label-based session notification muting are now implemented. Remaining: identity edge cases, persistent notification policy, dock reorder and close actions, accessible overlays and gestural navigation. See [src/shell](src/shell). |
+| Motion and effects | Shared transition primitives, app opening and workspace animation, reversible minimize/restore shrink and fade, live overview, Gaussian frost and refraction, safe graphics fallback and CPU frame timing | Finish the animation catalog and geometry-based input, extend single-panel backdrop reuse to regional and multi-panel damage tracking, and validate presentation measurements. See [src/shell/motion.rs](src/shell/motion.rs) and [src/shell/glass.rs](src/shell/glass.rs). |
 | Windows | Focus, move, resize, tile, maximize, minimize and restore, Alt+Tab, overview and native xdg fullscreen | Fullscreen edge-case tests, menus and tooltips, transient and modal behavior, activation, sequences across outputs and dock window selection. See [src/wayland/windows.rs](src/wayland/windows.rs). |
 | Settings | A searchable Settings window with Appearance, Display, Sound, Network, Bluetooth, Lock Screen, Accessibility, and Date & Time. Time zone uses the Debian system service. | A shared live device model, real laptop backlight, live display controls, and search inside individual pages. See [src/desktop/settings.rs](src/desktop/settings.rs). |
 | Lock and power | Compositor-owned password entry and Debian PAM authentication helper, wallpaper or clock-only AOD | Idle and lid policy, display-off, resume, lock on external sleep and multiple displays. See [src/wayland/lock.rs](src/wayland/lock.rs). |
@@ -67,6 +67,16 @@ respectively (one recomputation, three Gaussian/downsample passes). This is a
 static-backdrop interaction sample, not an FPS or GPU-time benchmark. The
 observed sequence sample count was zero, so missed-refresh performance remains
 unverified. Multi-panel and region-specific damage reuse remain open.
+
+Follow-up shell batch: Debian offline build and all 32 tests passed without
+warnings. The accelerated staging desktop opened a dock context menu, launched
+a second Console, listed both windows and restored a minimized window. Three
+D-Bus notifications from two app labels appeared grouped by label; toggling
+Mute changed both matching entries without changing the other app. Minimize
+and restore use reversible shrink/fade tracks; rapid reversal and lock
+interaction still require dedicated runtime tests. Dock-to-icon snapshot
+flight, close animation, keyboard menu navigation and persistent notification
+preferences remain open.
 
 ## Milestone 1 Visual identity and motion
 

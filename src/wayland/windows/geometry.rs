@@ -169,6 +169,7 @@ impl State {
         }
         self.opening_windows
             .retain(|(opening, _)| opening != &window);
+        self.minimize_motion.retain(|(other, _)| other != &window);
         self.redraw = true;
     }
 

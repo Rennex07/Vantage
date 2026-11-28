@@ -40,6 +40,8 @@ pub enum Action {
     NotificationClear,
     NotificationPage(isize),
     NotificationDismiss(u32),
+    NotificationMute(u32, u64),
+    NotificationUnmuteAll,
     NotificationInvoke(u32, usize, u64),
 }
 

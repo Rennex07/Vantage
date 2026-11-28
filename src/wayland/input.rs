@@ -28,6 +28,7 @@ use crate::{
 use super::State;
 
 pub(super) const BUTTON_LEFT: u32 = 0x110;
+const BUTTON_RIGHT: u32 = 0x111;
 
 #[derive(Clone, Copy)]
 pub enum Shortcut {
@@ -63,6 +64,9 @@ impl State {
             .dock_hits
             .as_ref()
             .is_some_and(|dock| dock.slot_at(pointer.current_location()) != dock.slot_at(location));
+        if let Some(menu) = &self.dock_menu {
+            self.redraw |= menu.hit(pointer.current_location()) != menu.hit(location);
+        }
         self.move_dragged_window(location);
         self.resize_dragged_window(location);
         let hovered = self.status_action_at(location);
@@ -73,6 +77,8 @@ impl State {
             .as_ref()
             .is_some_and(|dock| dock.contains(location));
         let surface = if self.overview.open
+            || self.dock_menu.is_some()
+            || self.dock_menu_press.is_some()
             || (!pointer.is_grabbed()
                 && (on_dock || self.status_at(location) || self.dock_pressed.is_some()))
         {
@@ -101,6 +107,9 @@ impl State {
         } else {
             self.redraw |= self.dock_pressed.take().is_some();
             self.status_pressed = None;
+            self.dock_menu = None;
+            self.dock_menu_press = None;
+            self.dock_right_pressed = false;
             if self.switching_windows {
                 self.toggle_overview();
             }
@@ -213,7 +222,13 @@ impl State {
                                 && !modifiers.ctrl
                                 && !modifiers.alt
                                 && symbol == keysyms::KEY_Tab;
-                            let handled = if modifiers.alt
+                            let handled = if data.dock_menu.is_some()
+                                && symbol == keysyms::KEY_Escape
+                            {
+                                data.dock_menu = None;
+                                data.redraw = true;
+                                true
+                            } else if modifiers.alt
                                 && !modifiers.logo
                                 && !modifiers.ctrl
                                 && matches!(symbol, keysyms::KEY_Tab | keysyms::KEY_ISO_Left_Tab)
@@ -379,7 +394,42 @@ impl State {
             }
             InputEvent::PointerButton { event } => {
                 let location = pointer.current_location();
+                if event.button_code() == BUTTON_RIGHT {
+                    if event.state() == ButtonState::Released && self.dock_right_pressed {
+                        self.dock_right_pressed = false;
+                        return;
+                    }
+                    if event.state() == ButtonState::Pressed
+                        && !pointer.is_grabbed()
+                        && !self.overview.open
+                    {
+                        if self.open_dock_menu(location) || self.dock_menu.take().is_some() {
+                            self.dock_right_pressed = true;
+                            self.redraw = true;
+                            self.move_pointer(location, serial, event.time_msec());
+                            return;
+                        }
+                    }
+                }
                 if event.button_code() == BUTTON_LEFT {
+                    if event.state() == ButtonState::Pressed && self.dock_menu.is_some() {
+                        self.dock_menu_press =
+                            Some(self.dock_menu.as_ref().and_then(|menu| menu.hit(location)));
+                        return;
+                    }
+                    if event.state() == ButtonState::Released
+                        && let Some(pressed) = self.dock_menu_press.take()
+                    {
+                        if let Some(menu) = self.dock_menu.take()
+                            && let Some(row) = pressed
+                            && menu.hit(location) == Some(row)
+                        {
+                            self.choose_dock_menu(menu, row, open_app);
+                        }
+                        self.redraw = true;
+                        self.move_pointer(location, serial, event.time_msec());
+                        return;
+                    }
                     if event.state() == ButtonState::Released
                         && let Some(pressed) = self.status_pressed.take()
                     {
@@ -480,7 +530,7 @@ impl State {
                 pointer.frame(self);
             }
             InputEvent::PointerAxis { event } => {
-                if self.overview.open {
+                if self.overview.open || self.dock_menu.is_some() {
                     return;
                 }
                 let source = event.source();
@@ -531,6 +581,13 @@ impl State {
                     .min(self.notifications.borrow().pages() - 1);
             }
             Action::NotificationDismiss(id) => self.notifications.borrow_mut().dismiss(id),
+            Action::NotificationMute(id, revision) => {
+                let mut center = self.notifications.borrow_mut();
+                if center.revision() == revision {
+                    center.toggle_app(id);
+                }
+            }
+            Action::NotificationUnmuteAll => self.notifications.borrow_mut().unmute_all(),
             Action::NotificationInvoke(id, index, revision) => {
                 let mut center = self.notifications.borrow_mut();
                 if center.revision() == revision {
