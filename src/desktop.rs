@@ -60,6 +60,7 @@ impl Tool {
 }
 
 fn wayland(command: &mut Command, socket: &OsStr) {
+    crate::graphics::configure_client(command);
     command
         .env("WAYLAND_DISPLAY", socket)
         .env("GDK_BACKEND", "wayland")
@@ -460,7 +461,16 @@ fn apply_style(style: &gtk::CssProvider, appearance: preferences::Appearance) {
                           border: 1px solid {selected}; border-top-color: alpha(white, 0.45);
                           border-radius: 18px; padding: 11px 14px; }}
          .settings-row:hover {{ background: {selected}; }}
-         .boxed-list row:selected, .vantage-settings stackswitcher button:checked {{
+         .settings-navigation {{
+             background: {surface}; padding: 12px; border-right: 1px solid {selected};
+         }}
+         .settings-navigation list {{ background: transparent; color: {text}; }}
+         .settings-navigation row {{
+             padding: 9px 10px; margin: 2px 0; border-radius: 12px;
+         }}
+         .settings-navigation row:hover {{ background: {raised}; }}
+         .settings-navigation row:focus-visible {{ outline: 2px solid {accent}; outline-offset: -2px; }}
+         .boxed-list row:selected, .settings-navigation row:selected {{
              background: {selected}; color: {text};
          }}
          .color-grid flowboxchild {{

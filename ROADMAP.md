@@ -33,13 +33,28 @@ This is the current local working tree. The repository's published history and t
 | Area | Present today | Work the roadmap builds on |
 | --- | --- | --- |
 | Login and boot | LightDM session entry, libseat-backed native mode, Winit preview, opt-in Plymouth theme | Repeatable install, greeter polish, session service lifecycle and recovery. See [session/vantage.desktop](session/vantage.desktop) and [src/native.rs](src/native.rs). |
-| Shell | Pi 4 wordmark, three workspaces, time and status, Console and Files in the pill | Pinning and running app state, notification history, accessible overlays, settings and gestural navigation. See [src/shell](src/shell). |
-| Motion and effects | App opening and workspace animation, live overview, Gaussian frost and refraction | A shared transition system, finish the rest of the animation catalog, couple visible geometry and hit testing, set quality tiers. See [src/shell/motion.rs](src/shell/motion.rs) and [src/shell/glass.rs](src/shell/glass.rs). |
-| Windows | Focus, move, resize, tile, maximize, minimize and restore, Alt+Tab, overview | Fullscreen, menus and tooltips, transient and modal behavior, activation, sequences across outputs, generalized dock restore. See [src/wayland/windows.rs](src/wayland/windows.rs). |
-| Settings | Volume, mute, sink selection, software dimming, links to network and Bluetooth utilities | A shared live device model, real laptop backlight, display mode and scale, and searchable settings. See [src/desktop/settings.rs](src/desktop/settings.rs). |
+| Shell | Pi 4 wordmark, three workspaces, time and status, app pinning and running indicators, notification banners and an in-memory center | Multi-window dock actions, identity edge cases, notification grouping and per-app policy, accessible overlays and gestural navigation. See [src/shell](src/shell). |
+| Motion and effects | Shared transition primitives, app opening and workspace animation, live overview, Gaussian frost and refraction, safe graphics fallback and CPU frame timing | Finish the animation catalog and geometry-based input, add damage-aware blur reuse, quality tiers and presentation measurements. See [src/shell/motion.rs](src/shell/motion.rs) and [src/shell/glass.rs](src/shell/glass.rs). |
+| Windows | Focus, move, resize, tile, maximize, minimize and restore, Alt+Tab, overview and native xdg fullscreen | Fullscreen edge-case tests, menus and tooltips, transient and modal behavior, activation, sequences across outputs and dock window selection. See [src/wayland/windows.rs](src/wayland/windows.rs). |
+| Settings | A searchable Settings window with Appearance, Display, Sound, Network, Bluetooth, Lock Screen, Accessibility, and Date & Time. Time zone uses the Debian system service. | A shared live device model, real laptop backlight, live display controls, and search inside individual pages. See [src/desktop/settings.rs](src/desktop/settings.rs). |
 | Lock and power | Compositor-owned password entry and Debian PAM authentication helper, wallpaper or clock-only AOD | Idle and lid policy, display-off, resume, lock on external sleep and multiple displays. See [src/wayland/lock.rs](src/wayland/lock.rs). |
 | Compatibility | xdg-shell, viewporter, file and text clipboard, DMA-BUF, optional Xwayland satellite | Activation, app decorations, popup grabs, primary selection, text input, gaming input, portals and capture. See [src/wayland.rs](src/wayland.rs) and [src/desktop/x11.rs](src/desktop/x11.rs). |
-| Hardware | Startup selects one GPU and one connected output with 1× scale | Live output changes, displays and DPI, capability-aware input and GPU/display recovery. The VM's VMSVGA/software configuration is a useful low-end test. |
+| Hardware | Startup selects one GPU and one connected output at 1× Wayland scale. The session can request a startup resolution. | Live output changes, displays and DPI, capability-aware input and GPU/display recovery. The VM's VMSVGA/software configuration is a useful low-end test. |
+
+### Staging validation (2026-11-28)
+
+Vantage Test, Debian 13 amd64, VirtualBox 7.2.8, VMSVGA 3D enabled:
+native GLES reported SVGA3D at 1920x1080 and 60 Hz with Full effects and
+the safe-effects fallback inactive. GTK4 clients launched by Vantage used
+Cairo to avoid the virtual graphics text/control corruption; the compositor
+retained accelerated GLES. The launcher, Console and Settings rendered
+correctly. Firefox entered and exited fullscreen with its floating geometry
+restored and appeared in the running-app dock. The native notification
+service accepted a D-Bus notification and displayed its banner and history.
+Offline Cargo build and 29 tests passed, with one unused-import warning.
+This is smoke-test evidence, not a complete milestone gate. Frame pacing,
+damage-aware blur caching, animation reversal, notification privacy/action
+edge cases, other applications, and the physical hardware matrix remain open.
 
 ## Milestone 1 Visual identity and motion
 
@@ -61,7 +76,7 @@ Make dragging, swipes and slider motion follow the pointer or fingers immediatel
 
 | Surface | Motion to implement | Interaction to verify |
 | --- | --- | --- |
-| Plymouth and greeter | Wordmark resolves, animated ring follows boot, greeter background and wordmark align with Plymouth | Boot and login recover on fallback graphics and have an accessible password prompt. Splash can be skipped for boot detail. |
+| Plymouth and greeter | Wordmark and local time on an ordinary boot, with the greeter aligned to Plymouth | Boot and login recover on fallback graphics and have an accessible password prompt. Splash can be skipped for boot detail. |
 | First desktop frame | Wallpaper, bar and pill settle into place without delaying keyboard or clicks | The user can open Console as soon as the scene is usable. Relogin uses the same animation and timing. |
 | Desktop to lock | Close interactive overlays, switch the security boundary, then ease into the lock wallpaper and clock | First secure scanout and input isolation precede animation and privacy-sensitive state is absent everywhere. |
 | Lock to AOD | Clock and date simplify into either wallpaper or clock-only mode. Highlights fade to their low-brightness values. | A rapid lock/wake or a scheduled display-off never leaves an intermediate state. |
@@ -93,7 +108,7 @@ Make dragging, swipes and slider motion follow the pointer or fingers immediatel
 
 **Security boundary.** Model desktop, lock requested, safe opaque frame, lock UI, AOD, display-off and suspended as related states with clear allowed transitions. Compositor-owned visuals can draw wallpaper and sanitized clock/battery data. The compositor takes password input while normal Wayland surfaces are unfocused. A separate helper verifies it with Debian PAM over a private pipe. Preload trusted lock/AOD assets. Use trusted wallpaper and graphics as the lock transition's only visual sources. The compositor must stop capture delivery before lock content appears and leave every screen covered while a locker starts, crashes, or an output attaches. Lock acknowledgement waits for the secure frame on every participating output or a safely disabled output. Ending lock requires authenticated unlock or deliberate recovery through an authorized greeter/logout path. Suppress private titles, wallpaper previews from arbitrary apps, notifications, camera thumbnails, media metadata and user files from AOD by default.
 
-**Wake interaction.** Accept a deliberate keyboard or pointer wake and a configurable touchpad wake policy. Quiet small pointer movements can be ignored while dimmed to avoid waking from noise. Decide which events only reveal the prompt and which belong to input after focus exists. Cover first password keystroke, wrong password, retry, caps lock, keyboard layout, screen off, hotplug and lid transitions. Add a clear accessible indication for users who cannot see the current mode. Preview mode offers a way out when the test user has a locked Debian password, and actual lock uses valid PAM authentication and documented account setup.
+**Wake interaction.** Keep pointer motion quiet while dimmed, and consider a separate touchpad wake preference after physical testing. While AOD is active, the first key press or a left double-click wakes the lock screen and reveals an empty password field. A held wake key must not add repeats to the password. A single click and pointer movement leave AOD active. Cover first password keystroke, wrong password, retry, caps lock, keyboard layout, screen off, hotplug and lid transitions. Add a clear accessible indication for users who cannot see the current mode. Preview mode offers a way out when the test user has a locked Debian password, and actual lock uses valid PAM authentication and documented account setup.
 
 **AOD acceptance.** Both styles run for 30 minutes in the VM with no continuous repaint when settled, wake from keyboard and mouse, load after reboot, and survive ten lock/unlock cycles. On the laptop, record measured idle, AOD and display-off power on AC and battery, including whether the display's actual mode or brightness changes. Test suspend triggered by the menu, by logind and by lid close. Record blur-on and blur-off motion separately. Add a test window with a conspicuous private pattern and assert it is absent from AOD, outputs attached after lock, and capture streams once lock begins. Wrong password, killed locker, missing locker, resume without cursor, and two displays each need a recovery test. [Debian 13 logind API](https://manpages.debian.org/trixie/systemd/org.freedesktop.login1.5.en.html)
 
@@ -107,11 +122,11 @@ Make dragging, swipes and slider motion follow the pointer or fingers immediatel
 
 ### First implementation batches
 
-1. Capture the current boot, wake, Console launch, Files on a white browser, overview and quick panel on the named VM. Record native renderer and mode and establish event/frame baselines with full and minimal effects.
+1. Capture the current boot, wake, Console launch, Files, overview and quick panel. Use Vantage Test at 1920×1080 for local iteration and the named release VM for the milestone recording. Record the build, renderer and active mode alongside measurements with Full and Reduced effects. Measure the same interaction sequence in both presets so the results are comparable.
 2. Add shared colors, typography, edges and timing. Land revised Midnight dock, top bar and Quick Settings together with a Reduced Effects control and screenshot pairs. Add visual regression fixtures with deterministic wallpaper and clock.
 3. Add the shared animator and geometry-based hit testing. Port existing launch and overview effects first, then deliver minimize/restore, tile/maximize, launcher and panel reveal. Exercise rapid reversal and concurrent animations. Fix missing fullscreen and popup handling while touching these paths.
 4. Build two static AOD previews and the clock/wallpaper unlock handoff in a sample or preview mode. Hook the real modes to the fail-closed lock compositor once state and power tests pass. Add shared Appearance, Lock Screen and Power controls.
-5. Finish coordinated Plymouth, greeter theme and shell first-frame art in a clean guest. Use common assets and matching backdrop framing. Keep safe greeter fallback, boot messages and any OS/disk-password flow functional. Publish a complete boot-to-unlock recording and separate Classic and Wallpaper AOD recordings.
+5. Use the Vantage wordmark and local time on normal Plymouth boots. Check how the splash hands off to the greeter and the first desktop frame, and match asset placement across those stages. Keep safe greeter fallback, boot messages and any OS/disk-password flow functional. Publish a complete boot-to-unlock recording and separate Classic and Wallpaper AOD recordings.
 6. Deploy the visual slice to the known test VM, capture comparisons on bright and dark backdrops and software rendering, then arrange native testing of the laptop with the package and recovery session. Gate the following milestone on safe lock, controllable performance and usable keyboard input.
 
 

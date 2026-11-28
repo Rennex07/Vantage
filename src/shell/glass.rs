@@ -184,7 +184,7 @@ impl Glass {
             let Some(visible) = panel.bounds.intersection(bounds) else {
                 continue;
             };
-            {
+            if panel.behind != remaining {
                 let mut frame = renderer.render(&mut scene, size, SURFACE_TRANSFORM)?;
                 draw_render_elements(
                     &mut frame,
@@ -256,7 +256,7 @@ impl Glass {
             )?;
             let _ = frame.finish()?;
         }
-        {
+        if remaining > 0 {
             let mut frame = renderer.render(&mut scene, size, SURFACE_TRANSFORM)?;
             draw_render_elements(&mut frame, 1.0, &windows.elements[..remaining], &[bounds])?;
             let _ = frame.finish()?;

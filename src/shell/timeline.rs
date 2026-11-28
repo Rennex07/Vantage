@@ -1,4 +1,4 @@
-﻿use std::time::{Duration, Instant};
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy)]
 pub enum Ease {
@@ -54,6 +54,50 @@ impl Transition {
     }
 }
 
+#[derive(Default)]
+pub struct Animation {
+    target: f64,
+    transition: Option<Transition>,
+}
+
+impl Animation {
+    pub fn value(&self, now: Instant) -> f64 {
+        self.transition
+            .as_ref()
+            .map_or(self.target, |track| track.value(now))
+    }
+
+    pub fn retarget(&mut self, target: f64, now: Instant, duration: Duration, easing: Ease) {
+        if duration.is_zero() {
+            self.target = target;
+            self.settle();
+        } else if target != self.target {
+            let from = self.value(now);
+            self.transition =
+                (from != target).then(|| Transition::new(from, target, now, duration, easing));
+            self.target = target;
+        }
+    }
+
+    pub fn is_animating(&self) -> bool {
+        self.transition.is_some()
+    }
+
+    pub fn finish_frame(&mut self, now: Instant) {
+        if self
+            .transition
+            .as_ref()
+            .is_some_and(|track| track.finished(now))
+        {
+            self.settle();
+        }
+    }
+
+    pub fn settle(&mut self) {
+        self.transition = None;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -82,5 +126,26 @@ mod tests {
         let immediate = Transition::new(2.0, 4.0, now, Duration::ZERO, Ease::Smooth);
         assert_eq!(immediate.value(now), 4.0);
         assert!(immediate.finished(now));
+    }
+
+    #[test]
+    fn independent_tracks_reverse_without_jumping_and_can_snap() {
+        let now = Instant::now();
+        let duration = Duration::from_millis(200);
+        let halfway = now + duration / 2;
+        let mut overview = Animation::default();
+        let mut panel = Animation::default();
+        overview.retarget(1.0, now, duration, Ease::Smooth);
+        panel.retarget(1.0, halfway, duration, Ease::Out);
+        overview.retarget(0.0, halfway, duration, Ease::Smooth);
+        assert_eq!(overview.value(halfway), 0.5);
+        assert_eq!(panel.value(halfway), 0.0);
+        panel.retarget(1.0, halfway, Duration::ZERO, Ease::Out);
+        assert_eq!(panel.value(halfway), 1.0);
+        assert!(!panel.is_animating());
+        let end = halfway + duration;
+        assert_eq!(overview.value(end), 0.0);
+        overview.finish_frame(end);
+        assert!(!overview.is_animating());
     }
 }

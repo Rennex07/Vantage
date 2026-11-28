@@ -22,6 +22,7 @@ do
     install -m 644 "$image" "$themes/vantage/"
 done
 
+install -Dm755 "$base/boot-clock.sh" /etc/initramfs-tools/scripts/local-bottom/vantage-boot-clock
 plymouth-set-default-theme vantage
 update-initramfs -u -k all
 
@@ -36,6 +37,14 @@ esac
 case " $GRUB_CMDLINE_LINUX_DEFAULT " in
     *' splash '*) ;;
     *) GRUB_CMDLINE_LINUX_DEFAULT="$GRUB_CMDLINE_LINUX_DEFAULT splash" ;;
+esac
+case " $GRUB_CMDLINE_LINUX_DEFAULT " in
+    *' loglevel='*) ;;
+    *) GRUB_CMDLINE_LINUX_DEFAULT="$GRUB_CMDLINE_LINUX_DEFAULT loglevel=3" ;;
+esac
+case " $GRUB_CMDLINE_LINUX_DEFAULT " in
+    *' systemd.show_status='*) ;;
+    *) GRUB_CMDLINE_LINUX_DEFAULT="$GRUB_CMDLINE_LINUX_DEFAULT systemd.show_status=auto" ;;
 esac
 case " $GRUB_CMDLINE_LINUX_DEFAULT " in
     *' plymouth.ignore-serial-consoles '*) ;;

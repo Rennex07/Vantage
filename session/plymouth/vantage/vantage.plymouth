@@ -5,8 +5,8 @@ ModuleName=two-step
 
 [two-step]
 ImageDir=/usr/share/plymouth/themes/vantage
-Font=Roboto 12
-TitleFont=Roboto Black 26
+Font=Sans 20
+TitleFont=Sans Bold 26
 BackgroundStartColor=0x101c31
 BackgroundEndColor=0x050916
 HorizontalAlignment=.5
@@ -23,7 +23,9 @@ Transition=none
 MessageBelowAnimation=true
 
 [boot-up]
+UseAnimation=false
 UseEndAnimation=false
+UseProgressBar=false
 
 [shutdown]
 UseEndAnimation=false

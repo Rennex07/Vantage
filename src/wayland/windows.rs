@@ -9,7 +9,9 @@ use smithay::{
     },
     delegate_xdg_shell,
     desktop::{PopupKind, Space, Window, WindowSurfaceType, space::SpaceElement},
-    reexports::wayland_server::protocol::{wl_seat::WlSeat, wl_surface::WlSurface},
+    reexports::wayland_server::protocol::{
+        wl_output::WlOutput, wl_seat::WlSeat, wl_surface::WlSurface,
+    },
     utils::{Logical, Physical, Point, Rectangle, SERIAL_COUNTER, Scale, Serial, Size},
     wayland::{
         compositor::{get_parent, is_sync_subsurface, with_states},
@@ -22,7 +24,7 @@ use smithay::{
 
 use crate::shell::{
     glass::FrostedWindow,
-    launch::App,
+    launch::{App, Target},
     motion::{Opening, Pose},
     status::BAR_HEIGHT,
 };
@@ -64,15 +66,26 @@ impl State {
             return;
         };
         let toplevel = window.toplevel().expect("Wayland window");
-        if !toplevel.is_initial_configure_sent() {
-            toplevel.send_configure();
-        }
         let was_empty = window.bbox().size.is_empty();
         window.on_commit();
-        if was_empty && !window.bbox().size.is_empty() {
+        let is_empty = window.bbox().size.is_empty();
+        if !toplevel.is_initial_configure_sent() && (was_empty || !is_empty) {
+            if let Some(output) = self.spaces[index].output_geometry(&self.output) {
+                configure_toplevel(toplevel, output.size);
+            }
+            toplevel.send_configure();
+        }
+        if was_empty && !is_empty {
             let launch =
                 window_app(&window).and_then(|app| self.pending_launches[app.index()].take());
-            let workspace = launch.map_or(index, |launch| launch.workspace);
+            let desktop_launch = match self.dock_target(&window) {
+                Some(Target::Desktop(id)) => self.pending_desktop.remove(&id),
+                _ => None,
+            };
+            let workspace = launch
+                .map(|launch| launch.workspace)
+                .or_else(|| desktop_launch.map(|(_, workspace)| workspace))
+                .unwrap_or(index);
             let Some(output) = self.spaces[workspace].output_geometry(&self.output) else {
                 return;
             };
@@ -82,7 +95,7 @@ impl State {
             let location = centered_location(&window, output.size);
             self.opening_windows
                 .retain(|(opening, _)| opening != &window);
-            if !self.appearance.reduce_motion {
+            if !self.appearance.reduce_motion && !geometry::is_fullscreen(&window) {
                 self.opening_windows
                     .push((window.clone(), Opening::new(Instant::now(), launch)));
             }
@@ -91,11 +104,14 @@ impl State {
             if active && self.host_focused && !self.overview.open && !self.lock_active() {
                 self.focus_window(Some(&window));
             }
-        } else if !was_empty && window.bbox().size.is_empty() {
+        } else if !was_empty && is_empty {
             self.minimized_windows.retain(|other| other != &window);
+            self.forget_window_geometry(&window);
+            self.opening_windows.retain(|(other, _)| other != &window);
             if index == self.workspaces.active {
                 self.focus_last_window();
             }
+            return;
         }
         self.apply_window_geometry(&window);
     }
@@ -186,27 +202,6 @@ impl State {
         self.redraw = true;
     }
 
-    pub(super) fn restore_dock_window(&mut self, app: App) -> bool {
-        let target = self
-            .minimized_windows
-            .iter()
-            .rev()
-            .find(|window| {
-                !window.bbox().size.is_empty()
-                    && self.spaces[self.workspaces.active]
-                        .element_location(window)
-                        .is_some()
-                    && window_app(window) == Some(app)
-            })
-            .cloned();
-        if let Some(window) = target {
-            self.focus_window(Some(&window));
-            true
-        } else {
-            false
-        }
-    }
-
     pub(super) fn close_focused_window(&self) {
         if let Some(surface) = self.keyboard.current_focus()
             && let Some((_, window)) = self.find_window(&surface)
@@ -216,20 +211,53 @@ impl State {
         }
     }
 
-    pub(super) fn focus_pinned_window(&mut self, id: &str) -> bool {
-        let name = id.strip_suffix(".desktop").unwrap_or(id);
-        let target = self.spaces[self.workspaces.active]
-            .elements()
-            .rev()
-            .find(|window| {
-                !window.bbox().size.is_empty()
-                    && with_app_id(window, |app_id| {
-                        app_id.eq_ignore_ascii_case(name) || app_id.eq_ignore_ascii_case(id)
+    fn dock_target(&self, window: &Window) -> Option<Target> {
+        if let Some(app) = window_app(window) {
+            return Some(Target::BuiltIn(app));
+        }
+        with_app_id(window, |id| {
+            crate::shell::app_identity::desktop_id(id, &self.installed_desktop_ids)
+                .map(Target::Desktop)
+        })
+        .flatten()
+    }
+
+    pub fn running_dock_apps(&self) -> Vec<Target> {
+        let mut running = Vec::new();
+        for window in self.spaces.iter().flat_map(|space| space.elements()) {
+            if !window.bbox().size.is_empty()
+                && let Some(target) = self.dock_target(window)
+                && !running.contains(&target)
+            {
+                running.push(target);
+            }
+        }
+        running
+    }
+
+    pub fn focused_dock_app(&self) -> Option<Target> {
+        self.dock_target(&self.focused_window()?)
+    }
+
+    pub(super) fn focus_dock_window(&mut self, target: &Target) -> bool {
+        let active = self.workspaces.active;
+        let found = std::iter::once(active)
+            .chain((0..self.spaces.len()).filter(|&index| index != active))
+            .find_map(|index| {
+                self.spaces[index]
+                    .elements()
+                    .rev()
+                    .find(|window| {
+                        !window.bbox().size.is_empty()
+                            && self.dock_target(window).as_ref() == Some(target)
                     })
-                    .unwrap_or(false)
-            })
-            .cloned();
-        if let Some(window) = target {
+                    .map(|window| (index, window.clone()))
+            });
+        if let Some((workspace, window)) = found {
+            if self.overview.open {
+                self.toggle_overview();
+            }
+            self.select_workspace(workspace);
             self.focus_window(Some(&window));
             true
         } else {
@@ -245,8 +273,11 @@ impl State {
         let active = self.workspaces.active;
         let offset = self.workspace_offset(active, self.workspaces.position(now));
         let space = &self.spaces[active];
+        let fullscreen = self.fullscreen_window(active);
         space.elements().rev().find_map(|window| {
-            if self.minimized_windows.contains(window) {
+            if self.minimized_windows.contains(window)
+                || fullscreen.is_some_and(|top| top != window)
+            {
                 return None;
             }
             let target = self.window_target(space, window, offset)?;
@@ -261,6 +292,22 @@ impl State {
                 .is_in_input_region(&(position - origin.to_f64()))
                 .then_some((window, origin))
         })
+    }
+
+    fn fullscreen_window(&self, index: usize) -> Option<&Window> {
+        self.spaces[index]
+            .elements()
+            .rev()
+            .find(|window| {
+                !self.minimized_windows.contains(window) && !window.bbox().size.is_empty()
+            })
+            .filter(|window| geometry::is_fullscreen(window))
+    }
+
+    pub fn fullscreen_visible(&self, now: Instant) -> bool {
+        self.overview.amount(now) == 0.0
+            && self.workspaces.position(now) == self.workspaces.active as f64
+            && self.fullscreen_window(self.workspaces.active).is_some()
     }
 
     pub(super) fn surface_under(
@@ -292,7 +339,13 @@ impl State {
             }
             let space = &self.spaces[index];
             let offset = self.workspace_offset(index, position);
+            let fullscreen = (overview == 0.0)
+                .then(|| self.fullscreen_window(index).cloned())
+                .flatten();
             for window in space.elements_for_output(&self.output).rev() {
+                if fullscreen.as_ref().is_some_and(|top| top != window) {
+                    continue;
+                }
                 let minimized = self.minimized_windows.contains(window);
                 if minimized && (index != self.workspaces.active || overview == 0.0) {
                     continue;
@@ -349,7 +402,9 @@ impl State {
                 windows.elements.extend(elements.into_iter().map(|element| {
                     RescaleRenderElement::from_element(element, (pivot.x, pivot.y).into(), scale)
                 }));
-                if let Some(theme) = frost_theme(window, self.appearance.theme) {
+                if !geometry::is_fullscreen(window)
+                    && let Some(theme) = frost_theme(window, self.appearance.theme)
+                {
                     let size = pose.rect.size.to_i32_round();
                     let bounds: Rectangle<i32, Physical> =
                         Rectangle::new((pivot.x, pivot.y).into(), (size.w, size.h).into());
@@ -459,8 +514,14 @@ impl State {
             {
                 continue;
             }
+            let fullscreen = (self.overview.amount(time) == 0.0)
+                .then(|| self.fullscreen_window(index))
+                .flatten();
             for window in space.elements_for_output(&self.output) {
-                if self.minimized_windows.contains(window) && self.overview.amount(time) == 0.0 {
+                if fullscreen.is_some_and(|top| top != window)
+                    || (self.minimized_windows.contains(window)
+                        && self.overview.amount(time) == 0.0)
+                {
                     continue;
                 }
                 window.send_frame(&self.output, stamp, Some(Duration::ZERO), |_, _| {
@@ -592,6 +653,17 @@ fn centered_location(window: &Window, output: Size<i32, Logical>) -> Point<i32, 
         .into()
 }
 
+fn configure_toplevel(surface: &ToplevelSurface, size: Size<i32, Logical>) {
+    surface.with_pending_state(|state| {
+        state.capabilities.replace([
+            geometry::WmCapabilities::Maximize,
+            geometry::WmCapabilities::Minimize,
+            geometry::WmCapabilities::Fullscreen,
+        ]);
+        state.bounds = Some(((size.w - 24).max(1), (size.h - 130).max(1)).into());
+    });
+}
+
 impl XdgShellHandler for State {
     fn xdg_shell_state(&mut self) -> &mut XdgShellState {
         &mut self.xdg_shell
@@ -600,14 +672,7 @@ impl XdgShellHandler for State {
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
         let space = &mut self.spaces[self.workspaces.active];
         if let Some(output) = space.output_geometry(&self.output) {
-            surface.with_pending_state(|state| {
-                state.capabilities.replace([
-                    geometry::WmCapabilities::Maximize,
-                    geometry::WmCapabilities::Minimize,
-                ]);
-                state.bounds =
-                    Some(((output.size.w - 24).max(1), (output.size.h - 130).max(1)).into());
-            });
+            configure_toplevel(&surface, output.size);
         }
         space.map_element(Window::new_wayland_window(surface), (0, 0), false);
     }
@@ -620,6 +685,7 @@ impl XdgShellHandler for State {
             return;
         };
         if index == self.workspaces.active
+            && !geometry::fullscreen_pending(&window)
             && let Some(mut location) = self.spaces[index].element_location(&window)
         {
             if let Some(restored) = self.restore_for_drag(&window) {
@@ -653,10 +719,28 @@ impl XdgShellHandler for State {
         self.set_maximized(&surface, false);
     }
 
+    fn fullscreen_request(&mut self, surface: ToplevelSurface, output: Option<WlOutput>) {
+        self.set_fullscreen(&surface, true, output);
+    }
+
+    fn unfullscreen_request(&mut self, surface: ToplevelSurface) {
+        self.set_fullscreen(&surface, false, None);
+    }
+
     fn minimize_request(&mut self, surface: ToplevelSurface) {
         if let Some((_, window)) = self.find_window(surface.wl_surface()) {
             self.minimize_window(window);
         }
+    }
+
+    fn app_id_changed(&mut self, surface: ToplevelSurface) {
+        if let Some((_, window)) = self.find_window(surface.wl_surface())
+            && !window.bbox().size.is_empty()
+            && let Some(Target::Desktop(id)) = self.dock_target(&window)
+        {
+            self.pending_desktop.remove(&id);
+        }
+        self.redraw = true;
     }
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
@@ -665,13 +749,6 @@ impl XdgShellHandler for State {
             self.spaces[index].unmap_elem(&window);
             self.minimized_windows.retain(|other| other != &window);
             self.forget_window_geometry(&window);
-            if self
-                .dragged_window
-                .as_ref()
-                .is_some_and(|drag| drag.window == window)
-            {
-                self.dragged_window = None;
-            }
             self.opening_windows
                 .retain(|(opening, _)| opening != &window);
             if focused {
@@ -707,4 +784,5 @@ impl XdgShellHandler for State {
 }
 
 delegate_xdg_shell!(State);
+mod fullscreen;
 mod geometry;

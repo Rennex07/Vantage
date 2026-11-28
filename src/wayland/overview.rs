@@ -8,9 +8,8 @@ use smithay::{
 
 use super::State;
 use crate::shell::{
-    dock::DOCK_RESERVE,
     status::BAR_HEIGHT,
-    timeline::{Ease, Transition},
+    timeline::{Animation, Ease},
     workspaces::WORKSPACE_COUNT,
 };
 
@@ -37,7 +36,7 @@ pub fn search_control() -> Rectangle<i32, Logical> {
 #[derive(Default)]
 pub(super) struct Overview {
     pub open: bool,
-    transition: Option<Transition>,
+    motion: Animation,
     pub(super) visible_cards: Vec<(Window, Rectangle<f64, Logical>)>,
     pub selected: usize,
     pub cards: Vec<Card>,
@@ -51,10 +50,7 @@ pub struct Card {
 
 impl Overview {
     pub fn amount(&self, now: Instant) -> f64 {
-        let target = f64::from(self.open);
-        self.transition
-            .as_ref()
-            .map_or(target, |transition| transition.value(now))
+        self.motion.value(now)
     }
 
     pub fn hit(&self, position: Point<f64, Logical>) -> Option<usize> {
@@ -66,7 +62,7 @@ impl Overview {
     }
 
     pub(super) fn settle(&mut self) {
-        self.transition = None;
+        self.motion.settle();
     }
 }
 
@@ -109,7 +105,7 @@ impl State {
     }
 
     pub fn overview_animating(&self) -> bool {
-        self.overview.transition.is_some()
+        self.overview.motion.is_animating()
     }
 
     pub fn overview_cards(&self) -> (&[Card], usize) {
@@ -145,15 +141,14 @@ impl State {
 
     fn set_overview(&mut self, open: bool) {
         let now = Instant::now();
-        self.overview.transition = (!self.appearance.reduce_motion).then(|| {
-            Transition::new(
-                self.overview.amount(now),
-                f64::from(open),
-                now,
-                TRANSITION,
-                Ease::Out,
-            )
-        });
+        let duration = if self.appearance.reduce_motion {
+            Duration::ZERO
+        } else {
+            TRANSITION
+        };
+        self.overview
+            .motion
+            .retarget(f64::from(open), now, duration, Ease::Out);
         self.overview.open = open;
         self.switching_windows = false;
         self.status_panel = crate::shell::status::Panel::Closed;
@@ -196,14 +191,7 @@ impl State {
     }
 
     pub fn update_overview(&mut self, now: Instant, output: Size<i32, Logical>, bar_height: i32) {
-        if self
-            .overview
-            .transition
-            .as_ref()
-            .is_some_and(|transition| transition.finished(now))
-        {
-            self.overview.settle();
-        }
+        self.overview.motion.finish_frame(now);
         if self.overview.amount(now) == 0.0 {
             self.overview.cards.clear();
             return;
@@ -231,7 +219,7 @@ impl State {
         }
         let count = windows.len();
         self.overview.selected = self.overview.selected.min(count.saturating_sub(1));
-        let slots = layout(output, bar_height, count);
+        let slots = layout(output, bar_height, self.dock_reserve, count);
         self.overview.cards = windows
             .into_iter()
             .zip(slots)
@@ -268,6 +256,7 @@ impl State {
 fn layout(
     output: Size<i32, Logical>,
     bar_height: i32,
+    dock_reserve: i32,
     count: usize,
 ) -> Vec<Rectangle<f64, Logical>> {
     if count == 0 {
@@ -276,7 +265,7 @@ fn layout(
     let w = f64::from(output.w.max(1));
     let h = f64::from(output.h.max(1));
     let top = f64::from(bar_height.max(BAR_HEIGHT as i32) + CONTROLS_HEIGHT) + 12.0;
-    let usable = (h - top - f64::from(DOCK_RESERVE) - 18.0).max(1.0);
+    let usable = (h - top - f64::from(dock_reserve) - 18.0).max(1.0);
     let columns = ((count as f64 * (w / usable / 1.55).clamp(0.5, 2.25))
         .sqrt()
         .ceil() as usize)
@@ -307,7 +296,7 @@ mod tests {
 
     #[test]
     fn previews_fit_between_shell_panels_without_overlapping() {
-        let slots = layout((1280, 800).into(), 42, 7);
+        let slots = layout((1280, 800).into(), 47, 97, 7);
         assert_eq!(slots.len(), 7);
         for (index, slot) in slots.iter().enumerate() {
             assert!(slot.loc.x > 0.0 && slot.loc.y > 42.0);

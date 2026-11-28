@@ -4,8 +4,7 @@ use super::{error_label, label, set_error};
 use crate::palette::{DARK_COLORS, Mode, Theme};
 use crate::preferences::{self, Aod, Effects};
 
-pub(super) fn page(parent: &gtk::ApplicationWindow) -> gtk::ScrolledWindow {
-    install_preview_style(parent);
+pub(super) fn page() -> gtk::Box {
     let content = super::page("Appearance");
     let effects = gtk::DropDown::from_strings(&["Full", "Balanced", "Reduced"]);
     effects.update_property(&[gtk::accessible::Property::Label("Effects")]);
@@ -15,10 +14,6 @@ pub(super) fn page(parent: &gtk::ApplicationWindow) -> gtk::ScrolledWindow {
         Effects::Balanced => 1,
         Effects::Reduced => 2,
     });
-    let transparency = gtk::CheckButton::with_label("Reduce transparency");
-    transparency.set_active(current.reduce_transparency);
-    let motion = gtk::CheckButton::with_label("Reduce motion");
-    motion.set_active(current.reduce_motion);
     let error = error_label();
     let mode = gtk::DropDown::from_strings(&["Dark", "Light"]);
     mode.update_property(&[gtk::accessible::Property::Label("Color mode")]);
@@ -95,6 +90,19 @@ pub(super) fn page(parent: &gtk::ApplicationWindow) -> gtk::ScrolledWindow {
             save(value, &error);
         }
     });
+    content.append(&label("Effects"));
+    content.append(&effects);
+    content
+}
+
+pub(super) fn accessibility_page() -> gtk::Box {
+    let content = super::page("Accessibility");
+    let current = preferences::appearance();
+    let transparency = gtk::CheckButton::with_label("Reduce transparency");
+    transparency.set_active(current.reduce_transparency);
+    let motion = gtk::CheckButton::with_label("Reduce motion");
+    motion.set_active(current.reduce_motion);
+    let error = error_label();
     transparency.connect_toggled({
         let error = error.clone();
         move |control| {
@@ -111,11 +119,17 @@ pub(super) fn page(parent: &gtk::ApplicationWindow) -> gtk::ScrolledWindow {
             save(value, &error);
         }
     });
-    content.append(&label("Effects"));
-    content.append(&effects);
     content.append(&transparency);
     content.append(&motion);
+    content.append(&error);
+    content
+}
 
+pub(super) fn lock_page(parent: &gtk::ApplicationWindow) -> gtk::Box {
+    install_preview_style(parent);
+    let content = super::page("Lock Screen");
+    let error = error_label();
+    let current = preferences::appearance();
     let title = label("Always-on display");
     title.add_css_class("title-2");
     content.append(&title);
@@ -156,10 +170,8 @@ pub(super) fn page(parent: &gtk::ApplicationWindow) -> gtk::ScrolledWindow {
         buttons.append(&button);
     }
     content.append(&buttons);
-    gtk::ScrolledWindow::builder()
-        .hscrollbar_policy(gtk::PolicyType::Never)
-        .child(&content)
-        .build()
+    content.append(&error);
+    content
 }
 
 fn select_dark_color(grid: &gtk::FlowBox, theme: Theme) {

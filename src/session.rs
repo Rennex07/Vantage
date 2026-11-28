@@ -43,11 +43,12 @@ use crate::{
     shell::{
         dock::{Dock, DockFrame},
         glass::{FrostedWindow, Glass, GlassStyle},
-        launch::{self, App},
+        launch::{self, App, Target},
         lockscreen::LockScreen,
+        notifications as notification_ui,
         status::{self, Panel, StatusBar},
         theme,
-        timeline::{Ease, Transition, progress},
+        timeline::{Animation, Ease, progress},
     },
     wallpaper::{self, Wallpaper},
     wayland::{ClientState, State, overview},
@@ -128,37 +129,24 @@ impl Server {
 
 #[derive(Default)]
 struct PanelMotion {
-    target: Panel,
     visible: Panel,
-    transition: Option<Transition>,
+    motion: Animation,
 }
 
 impl PanelMotion {
     fn amount(&mut self, target: Panel, now: Instant, reduce_motion: bool) -> f64 {
-        if target != self.target {
-            let from = self
-                .transition
-                .as_ref()
-                .map_or(f64::from(self.target.open()), |motion| motion.value(now));
-            let to = f64::from(target.open());
-            self.transition = (from != to)
-                .then(|| Transition::new(from, to, now, Duration::from_millis(180), Ease::Out));
-            self.target = target;
-            if target.open() {
-                self.visible = target;
-            }
+        if target.open() {
+            self.visible = target;
         }
-        if reduce_motion
-            || self
-                .transition
-                .as_ref()
-                .is_some_and(|motion| motion.finished(now))
-        {
-            self.transition = None;
-        }
-        self.transition
-            .as_ref()
-            .map_or(f64::from(target.open()), |motion| motion.value(now))
+        let duration = if reduce_motion {
+            Duration::ZERO
+        } else {
+            Duration::from_millis(180)
+        };
+        self.motion
+            .retarget(f64::from(target.open()), now, duration, Ease::Out);
+        self.motion.finish_frame(now);
+        self.motion.value(now)
     }
 }
 
@@ -166,14 +154,18 @@ pub struct Scene {
     wallpaper: Wallpaper,
     glass: Option<Glass>,
     glass_failed: bool,
+    lock_blur_failed: bool,
     dock: Dock,
     status: StatusBar,
     panel_motion: PanelMotion,
+    fullscreen_motion: Animation,
     lockscreen: LockScreen,
     started: Instant,
     cursor: Option<GlesTexture>,
     launch_card: GlesPixelProgram,
     notice: Option<(String, &'static str, GlesTexture)>,
+    notification_panel: Option<(u64, usize, crate::palette::Theme, GlesTexture)>,
+    notification_banner: Option<(u64, crate::palette::Theme, GlesTexture)>,
     label_theme: crate::palette::Theme,
     previous_bar: Option<(Size<i32, Physical>, GlesTexture)>,
     overview_labels: std::collections::HashMap<String, GlesTexture>,
@@ -181,18 +173,30 @@ pub struct Scene {
 }
 
 impl Scene {
-    pub fn new(renderer: &mut GlesRenderer, draw_cursor: bool) -> Result<Self, Box<dyn Error>> {
+    pub fn new(
+        renderer: &mut GlesRenderer,
+        draw_cursor: bool,
+        safe_graphics: bool,
+    ) -> Result<Self, Box<dyn Error>> {
         Ok(Self {
             wallpaper: Wallpaper::new(renderer)?,
-            glass: Glass::new(renderer)
-                .map_err(|error| {
-                    eprintln!("Could not initialize Files glass: {error}");
-                })
-                .ok(),
+            glass: (!safe_graphics)
+                .then(|| Glass::new(renderer))
+                .and_then(|result| {
+                    result
+                        .map_err(|error| {
+                            eprintln!(
+                                "Using solid surfaces after glass initialization failed: {error}"
+                            )
+                        })
+                        .ok()
+                }),
             glass_failed: false,
+            lock_blur_failed: false,
             dock: Dock::new(renderer)?,
             status: StatusBar::default(),
             panel_motion: PanelMotion::default(),
+            fullscreen_motion: Animation::default(),
             lockscreen: LockScreen::default(),
             started: Instant::now(),
             cursor: draw_cursor.then(|| load_cursor(renderer)).transpose()?,
@@ -201,6 +205,8 @@ impl Scene {
                 &[UniformName::new("accent", UniformType::_3f)],
             )?,
             notice: None,
+            notification_panel: None,
+            notification_banner: None,
             label_theme: Default::default(),
             previous_bar: None,
             overview_labels: Default::default(),
@@ -218,7 +224,8 @@ impl Scene {
                 || state.windows_are_opening()
                 || state.shell_is_animating()
                 || state.overview_animating()
-                || self.panel_motion.transition.is_some()
+                || self.panel_motion.motion.is_animating()
+                || self.fullscreen_motion.is_animating()
                 || self.wallpaper.animating(now)
                 || state.unlock_amount(now) > 0.0
                 || (!state.appearance.reduce_motion
@@ -253,7 +260,7 @@ impl Scene {
             state.appearance.reduce_transparency || state.appearance.effects == Effects::Reduced;
         let (reveal, dim, sign) = state.lock_amounts(now);
         let blur_amount = if state.lock_active() { sign } else { unlocking };
-        let lock_blur = if blur_amount > 0.0 && !solid_lock {
+        let lock_blur = if blur_amount > 0.0 && !solid_lock && !self.lock_blur_failed {
             self.glass.as_mut().and_then(|glass| {
                 glass
                     .lock_blur(
@@ -263,7 +270,10 @@ impl Scene {
                         state.appearance.theme,
                         self.wallpaper.animating(now),
                     )
-                    .map_err(|error| eprintln!("Could not blur the lock backdrop: {error}"))
+                    .map_err(|error| {
+                        self.lock_blur_failed = true;
+                        eprintln!("Using a solid lock prompt after backdrop blur failed: {error}");
+                    })
                     .ok()
             })
         } else {
@@ -271,6 +281,8 @@ impl Scene {
         };
         if state.lock_active() {
             self.panel_motion = PanelMotion::default();
+            self.notification_panel = None;
+            self.notification_banner = None;
             let ambient = match state.appearance.aod {
                 Aod::Wallpaper => {
                     if light {
@@ -357,20 +369,66 @@ impl Scene {
                     )?;
                 }
             }
-            return Ok(frame.finish()?);
+            let sync = frame.finish()?;
+            state.finish_lock_frame(now);
+            return Ok(sync);
         }
         state.finish_shell_frame(now);
-        self.dock.sync_pins(renderer, &state.dock_pins)?;
+        let running = state.running_dock_apps();
+        let focused = state.focused_dock_app();
+        let mut apps = state.dock_pins.clone();
+        let mut unpinned: Vec<_> = running
+            .iter()
+            .filter_map(|target| match target {
+                Target::Desktop(id) if !apps.iter().any(|pin| pin.id == *id) => Some(id),
+                _ => None,
+            })
+            .collect();
+        unpinned.sort_unstable();
+        apps.extend(
+            unpinned
+                .into_iter()
+                .take(6)
+                .map(|id| crate::preferences::DockPin {
+                    id: id.clone(),
+                    icon: None,
+                }),
+        );
+        self.dock.sync_apps(renderer, &apps)?;
         let position = state.workspaces.position(now);
+        let fullscreen = state.fullscreen_visible(now);
+        let chrome_duration = if state.appearance.reduce_motion {
+            Duration::ZERO
+        } else {
+            Duration::from_millis(180)
+        };
+        self.fullscreen_motion
+            .retarget(f64::from(fullscreen), now, chrome_duration, Ease::Out);
+        self.fullscreen_motion.finish_frame(now);
+        let chrome_opacity = 1.0 - self.fullscreen_motion.value(now) as f32;
         let top = status::bounds(size.w, scale);
+        state.dock_reserve = crate::shell::dock::reserve(size, scale, state.dock_pins.len());
         state.update_overview(now, (size.w, size.h).into(), top.size.h);
         let overview = state.overview_amount(now);
+        state.notification_hits = Default::default();
+        state
+            .notifications
+            .borrow_mut()
+            .set_private(unlocking > 0.0);
         let panel_amount =
             self.panel_motion
                 .amount(state.status_panel, now, state.appearance.reduce_motion);
         let mut panel_bounds = status::panel_bounds(size, top, self.panel_motion.visible);
         panel_bounds.loc.y -= ((1.0 - panel_amount) * 8.0).round() as i32;
-        state.status_hits = Some((top, panel_bounds));
+        state.status_hits = Some((
+            if fullscreen {
+                Rectangle::from_size((0, 0).into())
+            } else {
+                top
+            },
+            panel_bounds,
+        ));
+        state.bar_height = Some(top.size.h);
         let solid = state.appearance.reduce_transparency
             || state.appearance.effects == Effects::Reduced
             || self.glass_failed
@@ -384,12 +442,13 @@ impl Scene {
             hovered: state.status_hovered,
             overview: state.overview_open(),
             native: state.native_session,
+            notifications: state.notifications_available && unlocking == 0.0,
             error: state.status_error,
         };
         let theme = state.appearance.theme;
         let appearance_amount = self.wallpaper.transition_amount(now);
         if self.label_theme != theme {
-            if appearance_amount < 1.0 {
+            if appearance_amount < 1.0 && !fullscreen {
                 let mut previous = status_view.clone();
                 previous.theme = self.label_theme;
                 let old_bar = self.status.texture(renderer, top.size, &previous)?.clone();
@@ -402,10 +461,6 @@ impl Scene {
         if appearance_amount >= 1.0 {
             self.previous_bar = None;
         }
-        let bar = self
-            .status
-            .texture(renderer, top.size, &status_view)?
-            .clone();
         let notice = if let Some((name, message, _)) = &state.notice {
             if !self
                 .notice
@@ -423,7 +478,11 @@ impl Scene {
             None
         };
         let mut windows = state.window_elements(renderer, position, now);
-        if panel_amount > 0.0 && !solid {
+        if panel_amount > 0.0
+            && !solid
+            && !fullscreen
+            && self.panel_motion.visible != Panel::Notifications
+        {
             windows.glass.insert(
                 0,
                 FrostedWindow {
@@ -453,6 +512,7 @@ impl Scene {
                 Err(error) => {
                     eprintln!("Could not render frosted surfaces: {error}");
                     self.glass_failed = true;
+                    self.previous_bar = None;
                     None
                 }
             }
@@ -460,12 +520,80 @@ impl Scene {
             None
         };
         status_view.solid |= self.glass_failed;
-        let panel = if panel_amount > 0.0 {
-            let mut panel_view = status_view.clone();
-            panel_view.panel = self.panel_motion.visible;
-            Some(self.status.panel(renderer, &panel_view)?.clone())
-        } else {
+        let bar = if chrome_opacity == 0.0 {
             None
+        } else {
+            Some(
+                self.status
+                    .texture(renderer, top.size, &status_view)?
+                    .clone(),
+            )
+        };
+        let (panel, banner) = {
+            let center = state.notifications.borrow();
+            let revision = center.revision();
+            let panel = if panel_amount <= 0.0 {
+                None
+            } else if self.panel_motion.visible == Panel::Notifications {
+                if unlocking > 0.0 {
+                    None
+                } else {
+                    let pages = center.pages();
+                    let page = state.notification_page.min(pages - 1);
+                    state.notification_page = page;
+                    state.notification_hits.rows = center
+                        .visible(page)
+                        .map(|entry| (entry.id, entry.actions.len()))
+                        .collect();
+                    state.notification_hits.revision = revision;
+                    state.notification_hits.page = page;
+                    state.notification_hits.pages = pages;
+                    if self.notification_panel.as_ref().is_none_or(
+                        |(old, old_page, old_theme, _)| {
+                            (*old, *old_page, *old_theme) != (revision, page, theme)
+                        },
+                    ) {
+                        self.notification_panel = Some((
+                            revision,
+                            page,
+                            theme,
+                            notification_ui::panel(renderer, theme, &center, page)?,
+                        ));
+                    }
+                    self.notification_panel
+                        .as_ref()
+                        .map(|(_, _, _, texture)| texture.clone())
+                }
+            } else {
+                let mut panel_view = status_view.clone();
+                panel_view.panel = self.panel_motion.visible;
+                Some(self.status.panel(renderer, &panel_view)?.clone())
+            };
+            let banner = if panel_amount == 0.0
+                && !fullscreen
+                && overview == 0.0
+                && unlocking == 0.0
+                && let Some(entry) = center.banner()
+            {
+                if self
+                    .notification_banner
+                    .as_ref()
+                    .is_none_or(|(old, old_theme, _)| (*old, *old_theme) != (revision, theme))
+                {
+                    self.notification_banner = Some((
+                        revision,
+                        theme,
+                        notification_ui::banner(renderer, theme, entry)?,
+                    ));
+                }
+                self.notification_banner
+                    .as_ref()
+                    .map(|(_, _, texture)| texture.clone())
+            } else {
+                self.notification_banner = None;
+                None
+            };
+            (panel, banner)
         };
         let pointer = state.pointer_location().to_i32_round();
         let cursor_elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> =
@@ -537,7 +665,10 @@ impl Scene {
             None
         };
         let mut frame = renderer.render(target, size, transform)?;
-        if let Some(scene) = glass_scene {
+        if fullscreen {
+            frame.clear([0.0, 0.0, 0.0, 1.0].into(), &[bounds])?;
+            draw_render_elements(&mut frame, 1.0, &windows.elements, &[bounds])?;
+        } else if let Some(scene) = glass_scene {
             draw_texture(&mut frame, scene, bounds, bounds)?;
         } else {
             wallpaper::draw(&mut frame, &wallpaper, bounds, 1.0)?;
@@ -627,7 +758,7 @@ impl Scene {
         for (app, rect, alpha) in state
             .launch_tiles(now)
             .chain(state.opening_tiles(position, now))
-            .filter(|_| overview == 0.0)
+            .filter(|_| overview == 0.0 && !fullscreen)
         {
             draw_launch_card(&mut frame, &self.launch_card, bounds, app, rect, alpha)?;
         }
@@ -645,13 +776,21 @@ impl Scene {
             ];
             frame.draw_solid(area, &edges, [0.35, 0.61, 0.81, 0.90].into())?;
         }
-        if let Some((old_size, previous)) = &self.previous_bar
-            && *old_size == top.size
-        {
-            draw_texture(&mut frame, previous, top, bounds)?;
-            draw_texture_with_opacity(&mut frame, &bar, top, bounds, appearance_amount)?;
-        } else {
-            draw_texture(&mut frame, &bar, top, bounds)?;
+        if let Some(bar) = bar {
+            if let Some((old_size, previous)) = &self.previous_bar
+                && *old_size == top.size
+            {
+                draw_texture_with_opacity(&mut frame, previous, top, bounds, chrome_opacity)?;
+                draw_texture_with_opacity(
+                    &mut frame,
+                    &bar,
+                    top,
+                    bounds,
+                    appearance_amount * chrome_opacity,
+                )?;
+            } else {
+                draw_texture_with_opacity(&mut frame, &bar, top, bounds, chrome_opacity)?;
+            }
         }
         if let Some(panel) = panel {
             draw_texture_with_opacity(
@@ -662,22 +801,40 @@ impl Scene {
                 panel_amount as f32,
             )?;
         }
-        state.dock_hits = self.dock.draw(
-            &mut frame,
-            &wallpaper,
-            bounds,
-            DockFrame {
-                scale,
-                now,
-                pressed: state.dock_pressed.as_ref(),
-                pointer: state.pointer_location(),
-                launching: state.dock_launch_intensity(now),
-                solid: status_view.solid,
-                reduce_motion: state.appearance.reduce_motion,
-                theme: state.appearance.theme,
-            },
-        )?;
-        if let Some(texture) = notice {
+        if let Some(banner) = banner {
+            let width = banner.size().w.min((size.w - 16).max(1));
+            let height = (banner.size().h * width / banner.size().w).max(1);
+            let position = Rectangle::new(
+                ((size.w - width - 8).max(0), top.size.h + 8).into(),
+                (width, height).into(),
+            );
+            draw_texture(&mut frame, &banner, position, bounds)?;
+            state.notification_hits.banner = position.intersection(bounds);
+        }
+        let dock_hits = if chrome_opacity == 0.0 {
+            None
+        } else {
+            self.dock.draw(
+                &mut frame,
+                &wallpaper,
+                bounds,
+                DockFrame {
+                    scale,
+                    now,
+                    pressed: state.dock_pressed.as_ref(),
+                    pointer: state.pointer_location(),
+                    launching: state.dock_launch_intensity(now),
+                    running: &running,
+                    focused: focused.as_ref(),
+                    opacity: chrome_opacity,
+                    solid: status_view.solid,
+                    reduce_motion: state.appearance.reduce_motion,
+                    theme: state.appearance.theme,
+                },
+            )?
+        };
+        state.dock_hits = if fullscreen { None } else { dock_hits };
+        if let Some(texture) = notice.filter(|_| !fullscreen) {
             let width = texture.size().w.min(size.w - 16).max(1);
             let rect = Rectangle::new(
                 ((size.w - width) / 2, top.size.h + 12).into(),
@@ -696,7 +853,7 @@ impl Scene {
                 (
                     (anchor.x.round() as i32 - texture.size().w / 2)
                         .clamp(0, (size.w - texture.size().w).max(0)),
-                    anchor.y.round() as i32 - 70,
+                    dock.top().round() as i32 - texture.size().h - 8,
                 )
                     .into(),
                 (texture.size().w, texture.size().h).into(),

@@ -11,6 +11,7 @@ use vte4::gtk::{self, gdk, gio, glib, prelude::*};
 use super::Tool;
 
 mod appearance;
+mod date_time;
 
 pub(super) fn show(app: &gtk::Application, sound_direct: bool) {
     if let Some(settings) = gtk::Settings::default() {
@@ -20,48 +21,183 @@ pub(super) fn show(app: &gtk::Application, sound_direct: bool) {
         .transition_type(gtk::StackTransitionType::Crossfade)
         .transition_duration(160)
         .build();
-    let switcher = gtk::StackSwitcher::builder()
-        .stack(&pages)
-        .halign(gtk::Align::Center)
-        .build();
     let header = gtk::HeaderBar::builder()
-        .title_widget(&switcher)
+        .title_widget(&gtk::Label::new(Some("Settings")))
         .decoration_layout(":minimize,maximize,close")
         .build();
+    let navigation = gtk::Box::new(gtk::Orientation::Vertical, 10);
+    navigation.add_css_class("settings-navigation");
+    navigation.set_width_request(210);
+    let search = gtk::SearchEntry::builder()
+        .placeholder_text("Search settings")
+        .build();
+    let categories = gtk::ListBox::builder()
+        .selection_mode(gtk::SelectionMode::Single)
+        .build();
+    categories.update_property(&[gtk::accessible::Property::Label("Settings categories")]);
+    let category_scroll = gtk::ScrolledWindow::builder()
+        .vexpand(true)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .child(&categories)
+        .build();
+    navigation.append(&search);
+    navigation.append(&category_scroll);
+    let content = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    content.append(&navigation);
+    content.append(&pages);
+    pages.set_hexpand(true);
+    pages.set_hhomogeneous(false);
     let window = gtk::ApplicationWindow::builder()
         .application(app)
         .title("Settings")
         .titlebar(&header)
-        .default_width(580)
-        .default_height(450)
-        .child(&pages)
+        .default_width(900)
+        .default_height(610)
+        .child(&content)
         .build();
     window.add_css_class("vantage-settings");
-    let connectivity = page("Connectivity");
-    let issue = error_label();
-    connectivity.append(&tool_button(
-        "Network & Wi-Fi",
-        "network-wireless-symbolic",
-        Tool::Network,
-        &issue,
-    ));
-    connectivity.append(&tool_button(
-        "Bluetooth devices",
-        "bluetooth-active-symbolic",
-        Tool::Bluetooth,
-        &issue,
-    ));
-    connectivity.append(&issue);
-    pages.add_titled(&connectivity, Some("connectivity"), "Connectivity");
-    let audio = Sound::page();
-    pages.add_titled(&audio, Some("sound"), "Sound");
-    pages.add_titled(&display_page(&window), Some("display"), "Display");
-    pages.add_titled(&appearance::page(&window), Some("appearance"), "Appearance");
-    if sound_direct {
-        pages.set_visible_child_name("sound");
+    let entries = [
+        (
+            "appearance",
+            "Appearance",
+            "preferences-desktop-theme-symbolic",
+            "theme colors wallpaper glass effects",
+            appearance::page(),
+        ),
+        (
+            "display",
+            "Display",
+            "video-display-symbolic",
+            "brightness resolution refresh screen",
+            display_page(&window),
+        ),
+        (
+            "sound",
+            "Sound",
+            "audio-volume-high-symbolic",
+            "audio output mixer volume mute",
+            Sound::page(),
+        ),
+        (
+            "network",
+            "Network",
+            "network-wireless-symbolic",
+            "wifi wi-fi ethernet internet",
+            device_page(
+                "Network",
+                "Network & Wi-Fi",
+                "network-wireless-symbolic",
+                Tool::Network,
+            ),
+        ),
+        (
+            "bluetooth",
+            "Bluetooth",
+            "bluetooth-active-symbolic",
+            "devices pair wireless",
+            device_page(
+                "Bluetooth",
+                "Bluetooth devices",
+                "bluetooth-active-symbolic",
+                Tool::Bluetooth,
+            ),
+        ),
+        (
+            "lock",
+            "Lock Screen",
+            "system-lock-screen-symbolic",
+            "aod always-on display clock wake",
+            appearance::lock_page(&window),
+        ),
+        (
+            "accessibility",
+            "Accessibility",
+            "preferences-desktop-accessibility-symbolic",
+            "motion animation transparency contrast",
+            appearance::accessibility_page(),
+        ),
+        (
+            "date-time",
+            "Date & Time",
+            "preferences-system-time-symbolic",
+            "clock timezone time zone region",
+            date_time::page(),
+        ),
+    ];
+    let mut keywords = Vec::new();
+    for (id, title, icon, terms, widget) in entries {
+        let row = gtk::ListBoxRow::new();
+        row.set_widget_name(id);
+        let item = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+        item.append(&gtk::Image::from_icon_name(icon));
+        item.append(&label(title));
+        row.set_child(Some(&item));
+        categories.append(&row);
+        keywords.push(format!("{} {terms}", title.to_lowercase()));
+        let scroll = gtk::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .child(&widget)
+            .build();
+        pages.add_named(&scroll, Some(id));
     }
+    let empty = label("No settings match your search.");
+    empty.set_margin_top(24);
+    empty.set_margin_start(24);
+    empty.set_valign(gtk::Align::Start);
+    pages.add_named(&empty, Some("no-results"));
+    let query = Rc::new(RefCell::new(String::new()));
+    categories.set_filter_func({
+        let query = query.clone();
+        move |row| {
+            let query = query.borrow();
+            let terms = &keywords[row.index() as usize];
+            query.split_whitespace().all(|word| terms.contains(word))
+        }
+    });
+    categories.connect_row_selected({
+        let pages = pages.clone();
+        move |_, row| {
+            if let Some(row) = row {
+                pages.set_visible_child_name(row.widget_name().as_str());
+            }
+        }
+    });
+    search.connect_search_changed({
+        let categories = categories.clone();
+        let pages = pages.clone();
+        move |search| {
+            query.replace(search.text().to_lowercase());
+            categories.invalidate_filter();
+            if categories
+                .selected_row()
+                .is_some_and(|row| row.is_child_visible())
+            {
+                return;
+            }
+            let first = (0..)
+                .map_while(|index| categories.row_at_index(index))
+                .find(|row| row.is_child_visible());
+            categories.select_row(first.as_ref());
+            if first.is_none() {
+                pages.set_visible_child_name("no-results");
+            }
+        }
+    });
+    categories.select_row(
+        categories
+            .row_at_index(if sound_direct { 2 } else { 0 })
+            .as_ref(),
+    );
     super::install_style(&window);
     window.present();
+}
+
+fn device_page(title: &str, action: &str, icon: &str, tool: Tool) -> gtk::Box {
+    let content = page(title);
+    let issue = error_label();
+    content.append(&tool_button(action, icon, tool, &issue));
+    content.append(&issue);
+    content
 }
 
 fn page(title: &str) -> gtk::Box {

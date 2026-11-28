@@ -8,7 +8,7 @@ use smithay::{
     backend::{
         allocator::Fourcc,
         renderer::{
-            ImportMem, Texture,
+            Frame, ImportMem, Texture,
             gles::{
                 GlesError, GlesFrame, GlesRenderer, GlesTexProgram, GlesTexture, Uniform,
                 UniformName, UniformType,
@@ -29,10 +29,24 @@ use super::{
 };
 
 const REVEAL: Duration = Duration::from_millis(336);
-pub const DOCK_RESERVE: i32 = 86;
+const RESERVE: f64 = 86.0;
 const BASE_WIDTH: f64 = 146.0;
 const HEIGHT: f64 = 72.0;
 const SLOT_WIDTH: f64 = 62.0;
+
+fn panel_width(pins: usize) -> f64 {
+    BASE_WIDTH + (pins + 1) as f64 * SLOT_WIDTH
+}
+
+fn fit_scale(output: smithay::utils::Size<i32, Physical>, scale: f64, pins: usize) -> f64 {
+    (scale * super::CHROME_SCALE)
+        .min(f64::from(output.w) / (panel_width(pins) + 24.0))
+        .min(f64::from(output.h) / (HEIGHT + 36.0))
+}
+
+pub fn reserve(output: smithay::utils::Size<i32, Physical>, scale: f64, pins: usize) -> i32 {
+    (RESERVE * fit_scale(output, scale, pins)).ceil() as i32
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Action {
@@ -49,6 +63,10 @@ pub struct DockHits {
 impl DockHits {
     pub fn contains(&self, point: smithay::utils::Point<f64, Logical>) -> bool {
         self.panel.contains(point)
+    }
+
+    pub fn top(&self) -> f64 {
+        self.panel.loc.y
     }
 
     pub fn anchor(&self, slot: usize) -> Point<f64, Logical> {
@@ -84,6 +102,9 @@ pub struct DockFrame<'a> {
     pub pressed: Option<&'a Action>,
     pub pointer: Point<f64, Logical>,
     pub launching: (f32, f32),
+    pub running: &'a [Target],
+    pub focused: Option<&'a Target>,
+    pub opacity: f32,
     pub solid: bool,
     pub reduce_motion: bool,
     pub theme: Theme,
@@ -125,7 +146,7 @@ impl Dock {
         })
     }
 
-    pub fn sync_pins(
+    pub fn sync_apps(
         &mut self,
         renderer: &mut GlesRenderer,
         pins: &[DockPin],
@@ -185,11 +206,9 @@ impl Dock {
         } else {
             self.reveal(view.now)
         };
-        let panel_width = BASE_WIDTH + (self.pins.len() + 1) as f64 * SLOT_WIDTH;
-        let scale = view
-            .scale
-            .min(bounds.size.w as f64 / (panel_width + 24.0))
-            .min(bounds.size.h as f64 / (HEIGHT + 36.0));
+        let opacity = reveal as f32 * view.opacity;
+        let panel_width = panel_width(self.pins.len());
+        let scale = fit_scale(bounds.size, view.scale, self.pins.len());
         let width = (panel_width * scale).round() as i32;
         let height = (HEIGHT * scale).round() as i32;
         let bottom = ((12.0 - 30.0 * (1.0 - reveal)) * scale).round() as i32;
@@ -259,7 +278,7 @@ impl Dock {
             &[Rectangle::new(visible.loc - panel.loc, visible.size)],
             &[],
             Transform::Normal,
-            reveal as f32,
+            opacity,
             Some(&self.shader),
             &[
                 Uniform::new("wallpaper_origin", origin),
@@ -308,9 +327,47 @@ impl Dock {
                     &[Rectangle::new(visible.loc - destination.loc, visible.size)],
                     &[],
                     Transform::Normal,
-                    reveal as f32,
+                    opacity,
                     None,
                     &[],
+                )?;
+            }
+        }
+        for (slot, action) in hits.actions.iter().enumerate() {
+            let Action::Launch(target) = action else {
+                continue;
+            };
+            if !view.running.contains(target) {
+                continue;
+            }
+            let center = hits.anchor(slot);
+            let width = if view.focused == Some(target) {
+                11.0
+            } else {
+                5.0
+            };
+            let width = (width * scale).round().max(2.0) as i32;
+            let height = (2.0 * scale).round().max(1.0) as i32;
+            let rect = Rectangle::new(
+                (
+                    center.x.round() as i32 - width / 2,
+                    (center.y + 26.0 * scale).round() as i32,
+                )
+                    .into(),
+                (width, height).into(),
+            );
+            if let Some(visible) = rect.intersection(bounds) {
+                let (r, g, b) = colors.accent;
+                frame.draw_solid(
+                    visible,
+                    &[Rectangle::from_size(visible.size)],
+                    [
+                        r as f32 * opacity,
+                        g as f32 * opacity,
+                        b as f32 * opacity,
+                        opacity,
+                    ]
+                    .into(),
                 )?;
             }
         }

@@ -1,9 +1,12 @@
 mod console;
 mod desktop;
 mod frame_metrics;
+mod graphics;
 mod lock_auth;
 mod native;
 mod nested;
+mod notification_bus;
+mod notifications;
 mod session;
 mod shell;
 mod wallpaper;

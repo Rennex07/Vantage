@@ -6,7 +6,7 @@ use std::{
 
 use smithay::{
     input::{keyboard::keysyms, pointer::MotionEvent},
-    utils::SERIAL_COUNTER,
+    utils::{Logical, Point, SERIAL_COUNTER},
 };
 
 use super::State;
@@ -16,7 +16,7 @@ use crate::{
     shell::{
         lockscreen::{self, SignIn, SignInStatus},
         status::Panel,
-        timeline::{Ease, Transition, progress},
+        timeline::{Animation, Ease, Transition, progress},
     },
 };
 
@@ -24,6 +24,8 @@ const DIM_AFTER_LOCK: Duration = Duration::from_secs(5);
 const DIM_AFTER_INPUT: Duration = Duration::from_secs(18);
 const DIM_DURATION: Duration = Duration::from_millis(850);
 const WAKE_DURATION: Duration = Duration::from_millis(360);
+const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(400);
+const DOUBLE_CLICK_RADIUS: f64 = 16.0;
 const SIGN_DURATION: Duration = Duration::from_millis(310);
 const UNLOCK_DURATION: Duration = Duration::from_millis(400);
 
@@ -61,13 +63,27 @@ impl Idle {
     }
 }
 
+struct WakeClick {
+    at: Instant,
+    location: Point<f64, Logical>,
+}
+
+impl WakeClick {
+    fn follows(&self, previous: &Self) -> bool {
+        let movement = self.location - previous.location;
+        self.at.duration_since(previous.at) <= DOUBLE_CLICK_INTERVAL
+            && movement.x.hypot(movement.y) <= DOUBLE_CLICK_RADIUS
+    }
+}
+
 pub(super) struct Lock {
     active: bool,
     covered_at: Option<Instant>,
     unlocked_at: Option<Instant>,
     idle: Idle,
+    wake_click: Option<WakeClick>,
     signing_in: bool,
-    sign_transition: Option<Transition>,
+    sign_motion: Animation,
     password: Password,
     user: String,
     status: SignInStatus,
@@ -86,8 +102,9 @@ impl Lock {
                 waking: None,
                 dim_started: false,
             },
+            wake_click: None,
             signing_in: false,
-            sign_transition: None,
+            sign_motion: Animation::default(),
             password: Password::default(),
             user: vte4::gtk::glib::user_name().to_string_lossy().into_owned(),
             status: SignInStatus::Ready,
@@ -97,24 +114,18 @@ impl Lock {
     }
 
     fn sign_amount(&self, now: Instant) -> f64 {
-        self.sign_transition
-            .as_ref()
-            .map_or(f64::from(self.signing_in), |sign| sign.value(now))
+        self.sign_motion.value(now)
     }
 
     fn show_sign_in(&mut self, visible: bool, now: Instant, reduced: bool) {
-        if self.signing_in != visible {
-            self.sign_transition = (!reduced).then(|| {
-                Transition::new(
-                    self.sign_amount(now),
-                    f64::from(visible),
-                    now,
-                    SIGN_DURATION,
-                    Ease::Out,
-                )
-            });
-            self.signing_in = visible;
-        }
+        let duration = if reduced {
+            Duration::ZERO
+        } else {
+            SIGN_DURATION
+        };
+        self.sign_motion
+            .retarget(f64::from(visible), now, duration, Ease::Out);
+        self.signing_in = visible;
         if !visible {
             self.password.clear();
             self.status = SignInStatus::Ready;
@@ -142,10 +153,12 @@ impl State {
             return Err(io::Error::new(io::ErrorKind::NotFound, SERVICE_PATH));
         }
         self.lock.active = true;
+        self.notifications.borrow_mut().set_private(true);
+        self.notification_hits = Default::default();
         self.lock.covered_at = None;
         self.lock.unlocked_at = None;
+        self.lock.wake_click = None;
         self.lock.show_sign_in(false, Instant::now(), true);
-        self.lock.sign_transition = None;
         if self.overview.open {
             self.toggle_overview();
         }
@@ -271,11 +284,19 @@ impl State {
     }
 
     pub fn lock_animating(&self, now: Instant) -> bool {
-        let (reveal, dim, sign) = self.lock_amounts(now);
+        let (reveal, dim, _) = self.lock_amounts(now);
         self.lock.covered_at.is_some()
             && ((reveal < 1.0 && !self.appearance.reduce_motion)
                 || (dim > 0.0 && dim < 1.0)
-                || (sign > 0.0 && sign < 1.0))
+                || self.lock.sign_motion.is_animating())
+    }
+
+    pub fn finish_lock_frame(&mut self, now: Instant) {
+        if self.appearance.reduce_motion {
+            self.lock.sign_motion.settle();
+        } else {
+            self.lock.sign_motion.finish_frame(now);
+        }
     }
 
     pub fn unlock_amount(&self, now: Instant) -> f32 {
@@ -301,7 +322,18 @@ impl State {
         }
     }
 
+    fn lock_is_ambient(&self, now: Instant) -> bool {
+        self.appearance.aod != Aod::Off && now >= self.lock.idle.dim_at
+    }
+
+    fn wake_lock_sign_in(&mut self, now: Instant) {
+        self.lock.password.clear();
+        self.lock.status = SignInStatus::Ready;
+        self.show_lock_sign_in(now);
+    }
+
     fn show_lock_sign_in(&mut self, now: Instant) {
+        self.lock.wake_click = None;
         self.lock.idle.wake(now, self.appearance.reduce_motion);
         self.lock
             .show_sign_in(true, now, self.appearance.reduce_motion);
@@ -313,6 +345,10 @@ impl State {
             return;
         }
         let now = Instant::now();
+        if self.lock_is_ambient(now) {
+            self.wake_lock_sign_in(now);
+            return;
+        }
         if symbol == keysyms::KEY_Escape && self.lock.auth_job.is_none() {
             self.lock.idle.wake(now, self.appearance.reduce_motion);
             self.lock
@@ -342,6 +378,24 @@ impl State {
         if self.lock.covered_at.is_none() {
             return;
         }
+        let now = Instant::now();
+        if self.lock_is_ambient(now) {
+            let click = WakeClick {
+                at: now,
+                location: self.pointer.current_location(),
+            };
+            if self
+                .lock
+                .wake_click
+                .take()
+                .is_some_and(|previous| click.follows(&previous))
+            {
+                self.wake_lock_sign_in(now);
+            } else {
+                self.lock.wake_click = Some(click);
+            }
+            return;
+        }
         if self.lock.signing_in
             && let Some(mode) = self.output.current_mode()
             && lockscreen::submit_contains(
@@ -352,7 +406,11 @@ impl State {
         {
             self.submit_password();
         }
-        self.show_lock_sign_in(Instant::now());
+        self.show_lock_sign_in(now);
+    }
+
+    pub(super) fn cancel_lock_pointer_wake(&mut self) {
+        self.lock.wake_click = None;
     }
 
     pub(super) fn lock_pointer_moved(&mut self) {
@@ -396,6 +454,22 @@ impl State {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn double_click_requires_close_presses_in_time_and_space() {
+        let at = Instant::now();
+        let first = WakeClick {
+            at,
+            location: (25.0, 25.0).into(),
+        };
+        let second = |delay, location| WakeClick {
+            at: at + delay,
+            location,
+        };
+        assert!(second(DOUBLE_CLICK_INTERVAL, (31.0, 30.0).into()).follows(&first));
+        assert!(!second(DOUBLE_CLICK_INTERVAL * 2, first.location).follows(&first));
+        assert!(!second(DOUBLE_CLICK_INTERVAL, (50.0, 25.0).into()).follows(&first));
+    }
 
     #[test]
     fn waking_reverses_the_current_dim_and_resets_the_deadline() {

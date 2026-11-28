@@ -17,6 +17,7 @@ use smithay::{
 
 use crate::{
     frame_metrics::FrameMetrics,
+    graphics::Profile,
     session::{Scene, Server},
     shell::launch,
     wayland::State,
@@ -30,7 +31,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     let (mut backend, events) = winit::init_from_attributes::<GlesRenderer>(window)?;
     let mut scene = {
         let (renderer, _) = backend.bind()?;
-        Scene::new(renderer, false)?
+        Scene::new(renderer, false, Profile::from_environment().safe("", ""))?
     };
 
     let mut event_loop = EventLoop::<State>::try_new()?;
@@ -57,7 +58,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     })?;
 
     println!("WAYLAND_DISPLAY={}", server.socket.to_string_lossy());
-    let mut metrics = FrameMetrics::new("nested");
+    let mut metrics = FrameMetrics::new("nested", None);
     let mut next_frame: Option<Instant> = None;
     while !state.closed {
         let now = Instant::now();
@@ -77,8 +78,10 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             } else {
                 let start = metrics.start();
                 let scale = backend.window().scale_factor();
+                let draw_start;
                 {
                     let (renderer, mut target) = backend.bind()?;
+                    draw_start = metrics.start();
                     let _ = scene.draw(
                         &mut state,
                         renderer,
@@ -90,7 +93,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                 }
                 let submit_start = metrics.start();
                 backend.submit(Some(&[Rectangle::from_size(size)]))?;
-                metrics.submitted(start, submit_start);
+                metrics.submitted(start, draw_start, submit_start);
                 state.frame_presented(Instant::now(), false);
                 next_frame = scene
                     .is_animating(&state)

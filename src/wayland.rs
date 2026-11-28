@@ -69,14 +69,21 @@ pub struct State {
     switching_windows: bool,
     minimized_windows: Vec<Window>,
     pending_launches: [Option<Launch>; App::ALL.len()],
+    pending_desktop: std::collections::HashMap<String, (Instant, usize)>,
+    installed_desktop_ids: std::collections::HashSet<String>,
     pub notice: Option<(String, &'static str, Instant)>,
     pub status_panel: Panel,
     pub status_hovered: Option<Action>,
     status_pressed: Option<Action>,
     pub status_error: Option<&'static str>,
     pub native_session: bool,
+    pub notifications: std::rc::Rc<std::cell::RefCell<crate::notifications::Center>>,
+    pub notifications_available: bool,
+    pub notification_page: usize,
+    pub notification_hits: crate::shell::notifications::Hits,
     lock: lock::Lock,
     pub status_hits: Option<(Rectangle<i32, Physical>, Rectangle<i32, Physical>)>,
+    pub bar_height: Option<i32>,
     host_focused: bool,
     pub workspaces: Workspaces,
     popups: PopupManager,
@@ -90,6 +97,7 @@ pub struct State {
     pub closed: bool,
     pub pending_clients: bool,
     pub dock_hits: Option<DockHits>,
+    pub dock_reserve: i32,
     pub dock_pressed: Option<DockAction>,
     pub dock_pins: Vec<crate::preferences::DockPin>,
     pub status: Status,
@@ -151,14 +159,21 @@ impl State {
             switching_windows: false,
             minimized_windows: Vec::new(),
             pending_launches: [None; App::ALL.len()],
+            pending_desktop: Default::default(),
+            installed_desktop_ids: launch::installed_desktop_ids(),
             notice: None,
             status_panel: Panel::Closed,
             status_hovered: None,
             status_pressed: None,
             status_error: None,
             native_session: false,
+            notifications: Default::default(),
+            notifications_available: false,
+            notification_page: 0,
+            notification_hits: Default::default(),
             lock: lock::Lock::new(),
             status_hits: None,
+            bar_height: None,
             host_focused: true,
             workspaces: Workspaces::default(),
             popups: PopupManager::default(),
@@ -175,6 +190,7 @@ impl State {
             closed: false,
             pending_clients: false,
             dock_hits: None,
+            dock_reserve: crate::shell::dock::reserve(mode.size, 1.0, 0),
             dock_pressed: None,
             dock_pins: crate::preferences::dock_pins(),
             status: Status::read(),
@@ -189,7 +205,9 @@ impl State {
     }
 
     fn start_app(&mut self, app: App, open: impl FnOnce(Target, Instant) -> std::io::Result<()>) {
-        if self.restore_dock_window(app) || self.pending_launches[app.index()].is_some() {
+        if self.focus_dock_window(&Target::BuiltIn(app))
+            || self.pending_launches[app.index()].is_some()
+        {
             return;
         }
         let Some(dock) = &self.dock_hits else {
@@ -217,12 +235,21 @@ impl State {
         id: String,
         open: impl FnOnce(Target, Instant) -> std::io::Result<()>,
     ) {
+        let target = Target::Desktop(id.clone());
+        if self.focus_dock_window(&target) || self.pending_desktop.contains_key(&id) {
+            return;
+        }
         self.notice = None;
-        if !self.focus_pinned_window(&id)
-            && let Err(error) = open(Target::Desktop(id.clone()), Instant::now())
-        {
-            eprintln!("Could not open {id}: {error}");
-            self.show_notice(launch::desktop_name(&id), "The app could not be started.");
+        let now = Instant::now();
+        match open(target, now) {
+            Ok(()) => {
+                self.pending_desktop
+                    .insert(id, (now, self.workspaces.active));
+            }
+            Err(error) => {
+                eprintln!("Could not open {id}: {error}");
+                self.show_notice(launch::desktop_name(&id), "The app could not be started.");
+            }
         }
         self.redraw = true;
     }
@@ -241,11 +268,24 @@ impl State {
                     self.show_notice(app.name().into(), exit.message);
                 }
             }
-            Target::Desktop(id) => self.show_notice(launch::desktop_name(&id), exit.message),
+            Target::Desktop(id) => {
+                if self
+                    .pending_desktop
+                    .get(&id)
+                    .is_some_and(|(started, _)| *started == exit.started)
+                {
+                    self.pending_desktop.remove(&id);
+                    self.show_notice(launch::desktop_name(&id), exit.message);
+                }
+            }
         }
     }
 
     pub fn finish_shell_frame(&mut self, now: Instant) {
+        let pending_before = self.pending_desktop.len();
+        self.pending_desktop
+            .retain(|_, (started, _)| now < *started + LAUNCH_TIMEOUT);
+        self.redraw |= pending_before != self.pending_desktop.len();
         for app in App::ALL {
             let pending = &mut self.pending_launches[app.index()];
             if pending.is_some_and(|launch| now >= launch.started + LAUNCH_TIMEOUT) {
@@ -289,15 +329,30 @@ impl State {
     }
 
     fn status_at(&self, point: Point<f64, Logical>) -> bool {
-        self.status_hits.is_some_and(|(bar, panel)| {
-            bar.to_f64().to_logical(1.0).contains(point)
-                || (self.status_panel.open() && panel.to_f64().to_logical(1.0).contains(point))
-        })
+        self.notification_hits.banner_contains(point)
+            || self.status_hits.is_some_and(|(bar, panel)| {
+                bar.to_f64().to_logical(1.0).contains(point)
+                    || (self.status_panel.open() && panel.to_f64().to_logical(1.0).contains(point))
+            })
     }
 
     fn status_action_at(&self, point: Point<f64, Logical>) -> Option<Action> {
-        self.status_hits
-            .and_then(|hits| status::action_at(hits, point, self.status_panel, self.native_session))
+        if self.notification_hits.banner_contains(point) {
+            return Some(Action::Notifications);
+        }
+        self.status_hits.and_then(|hits| {
+            if self.status_panel == Panel::Notifications
+                && let Some(action) = self.notification_hits.action_at(hits.1, point)
+            {
+                return Some(action);
+            }
+            status::action_at(hits, point, self.status_panel, self.native_session)
+                .filter(|action| *action != Action::Notifications || self.notifications_available)
+        })
+    }
+
+    pub fn notifications_private(&self, now: Instant) -> bool {
+        self.lock_active() || self.unlock_amount(now) > 0.0
     }
 
     pub fn refresh_preferences(&mut self) {
@@ -305,6 +360,7 @@ impl State {
         let pins = crate::preferences::dock_pins();
         if self.dock_pins != pins {
             self.dock_pins = pins;
+            self.installed_desktop_ids = launch::installed_desktop_ids();
             self.dock_hits = None;
             self.dock_pressed = None;
             self.redraw = true;

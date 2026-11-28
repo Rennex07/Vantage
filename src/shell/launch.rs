@@ -54,6 +54,15 @@ pub enum Target {
     Desktop(String),
 }
 
+pub fn installed_desktop_ids() -> std::collections::HashSet<String> {
+    gio::AppInfo::all()
+        .into_iter()
+        .filter_map(|app| app.id().map(Into::into))
+        .filter(|id: &String| preferences::valid_dock_id(id))
+        .chain(std::iter::once(SETTINGS_APP_ID.into()))
+        .collect()
+}
+
 pub fn desktop_app(id: &str) -> Option<gio::AppInfo> {
     gio::AppInfo::all()
         .into_iter()
@@ -89,6 +98,7 @@ pub fn open(
         .env_remove("WAYLAND_SOCKET")
         .env_remove("DISPLAY")
         .env_remove("XAUTHORITY");
+    crate::graphics::configure_client(&mut command);
     let title = match &target {
         Target::BuiltIn(app) => {
             command

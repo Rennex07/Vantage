@@ -49,10 +49,11 @@ Select **Vantage** at a display manager that supports Wayland sessions, such as
 Debian's LightDM. Vantage then runs directly on the active seat. Remove the old
 Vantage preview entry from your previous desktop's autostart if you used it.
 
-Open **Quick settings** from the top-right controls. **Settings** also appears
-in the app launcher. **Appearance** offers a warm Light theme with the Opal
+Open **Quick settings** from the top-right controls. Open **Settings** there or
+from the app launcher for a window with a searchable category sidebar. Use
+**Date & Time** to change the system time zone. **Appearance** offers a warm Light theme with the Opal
 wallpaper and seven Dark colors with matching Contours wallpaper and glass, as well as effects, solid
-surfaces, and reduced motion. Appearance changes apply to the shell, Settings,
+surfaces, and reduced motion under **Accessibility**. Appearance changes apply to the shell, Settings,
 app search, and Console as they run. Files uses the palette at launch.
 **Sound** adjusts volume, mute, and the default output
 device directly, with **Advanced mixer** for input devices and per-app volume.
@@ -62,10 +63,11 @@ for Bluetooth. The top panel reports battery and USB storage status when availab
 
 Open **Quick settings → Power** to lock or shut down. **F9** and **Super+L**
 also lock the session. After five seconds, the wallpaper dims as the clock
-moves down and grows. Press a key or click to show the current account's
-password field. Vantage verifies the password with Debian PAM. Set a Debian
+moves down and grows. While the always-on display is active, press a key or
+left double-click to wake it and show the password field. The wake key is
+consumed. Enter the password after the field appears. Vantage verifies the password with Debian PAM. Set a Debian
 password before locking an account configured for automatic login. In
-**Settings → Appearance**, choose full-screen wallpaper, clock only, or off.
+**Settings → Lock Screen**, choose full-screen wallpaper, clock only, or off.
 **Shut down** prompts for confirmation.
 **Alt+F4** closes the focused app.
 
@@ -79,8 +81,10 @@ sudo apt install plymouth plymouth-themes
 sudo sh session/plymouth/install.sh --enable-grub-splash
 ```
 
-Use **Esc** during the splash to view boot messages. If your bootloader already
-passes the `splash` kernel argument, omit `--enable-grub-splash`.
+The graphical splash shows the Vantage wordmark and the local time once the
+system disk is mounted. Use **Esc** during the splash to view boot messages.
+If your bootloader already passes `splash` and suppresses routine console
+output, omit `--enable-grub-splash`.
 The splash wordmark is rendered with Debian's Roboto Black face. To regenerate
 it after updating the artwork, run
 `target/debug/vantage --render-boot-wordmark session/plymouth/vantage/wordmark.png`.
@@ -95,21 +99,39 @@ Log in as a regular user at a local Linux virtual terminal and run:
 
 The session uses libseat to access graphics and input devices on the
 active seat. It checks the primary GPU first, then other GPUs on the seat,
-and selects one connected output. Vantage tries the largest resolution first,
-then the highest refresh at that resolution, and falls back if the driver
-cannot activate a mode. The dock and top controls scale up on tall,
+and selects one connected output. Vantage tries the output's preferred mode
+first, then other modes by resolution and refresh rate, and falls back if the
+driver cannot activate a mode. To prefer a particular startup resolution,
+set `VANTAGE_DISPLAY_SIZE=1920x1080` in the session environment. Vantage
+reports when it cannot use the requested size and tries the remaining modes.
+Changes to this setting take effect at the next session start.
+
+The dock and top controls scale up on tall,
 high-resolution outputs. On startup it
 reports the DRM device, output, GLES renderer, logical CPUs available
 to the process, and Wayland socket. Hardware rendering depends on the
 installed driver and graphics device. A renderer line containing `llvmpipe`
 indicates software rendering.
 
-Set `VANTAGE_FRAME_METRICS=1` when starting either backend to report median,
-P95 and P99 frame preparation and submission times to stderr. Reports group
-300 submitted frames, with a final partial group on normal shutdown. Native
-mode also measures the time from submission to handling the DRM callback.
-These timings describe CPU work and callback arrival. Hardware presentation
-and missed refresh intervals still need separate measurement.
+Native mode selects solid shell material on known software renderers by
+default. Accelerated SVGA3D retains compositor GLES frost. On systems with
+`vmwgfx`, Vantage-launched GTK4 clients use Cairo by default to avoid virtual
+GPU rendering defects; an explicit `GSK_RENDERER` overrides this choice.
+Set `VANTAGE_GRAPHICS=full` to compare with the configured effects, or
+`VANTAGE_GRAPHICS=safe` to force solid material in either backend.
+
+Set `VANTAGE_FRAME_METRICS=1` to report median, P95 and P99 CPU times for
+buffer binding, scene drawing, and submission. Native mode also reports DRM
+submit-to-callback latency and how many frames took more CPU time than one mode
+interval. Reports group 300 frames, with a final partial group on normal
+shutdown. Use the same mode and interaction sequence for each profile when
+comparing the results. Hardware presentation and missed refresh intervals
+require separate measurements.
+
+The dock raises or restores matching windows across workspaces and shows which
+apps are running. Use **Applications** to pin and unpin apps. In the native
+session, open **Alerts** or press **Super+N** to review notifications. Do Not
+Disturb hides banners, and the notification center is private while locked.
 
 Use **Ctrl+Alt+Esc** to open the logout confirmation, or **Ctrl+Alt+F1–F12**
 to switch virtual terminals. Console starts in your home directory and supports

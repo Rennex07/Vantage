@@ -24,7 +24,11 @@ use smithay::{
     },
     output::{Mode, PhysicalProperties, Subpixel},
     reexports::{
-        calloop::{EventLoop, Interest, Mode as PollMode, PostAction, generic::Generic},
+        calloop::{
+            EventLoop, Interest, Mode as PollMode, PostAction,
+            generic::Generic,
+            timer::{TimeoutAction, Timer},
+        },
         drm::control::{Device, Mode as DrmMode, ModeTypeFlags, connector, crtc},
         input::Libinput,
         rustix::fs::OFlags,
@@ -34,6 +38,7 @@ use smithay::{
 
 use crate::{
     frame_metrics::FrameMetrics,
+    graphics::Profile,
     session::{Scene, Server},
     shell::launch,
     wayland::{Shortcut, State},
@@ -43,6 +48,17 @@ type Result<T> = std::result::Result<T, Box<dyn Error>>;
 type Scanout = GbmBufferedSurface<GbmAllocator<DrmDeviceFd>, ()>;
 
 pub fn run() -> Result<()> {
+    let requested_size = match std::env::var("VANTAGE_DISPLAY_SIZE") {
+        Ok(value) => parse_display_size(&value).or_else(|| {
+            eprintln!("Ignoring invalid VANTAGE_DISPLAY_SIZE: expected WIDTHxHEIGHT");
+            None
+        }),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            eprintln!("Ignoring invalid VANTAGE_DISPLAY_SIZE: expected WIDTHxHEIGHT");
+            None
+        }
+    };
     let (mut session, session_events) = LibSeatSession::new()?;
     let seat = session.seat();
     if !session.is_active() {
@@ -56,7 +72,7 @@ pub fn run() -> Result<()> {
     }
     let (kms, drm_events) = outputs
         .iter()
-        .find_map(|path| match Kms::open(&mut session, path) {
+        .find_map(|path| match Kms::open(&mut session, path, requested_size) {
             Ok(output) => Some(output),
             Err(error) => {
                 eprintln!("Could not use {}: {error}", path.display());
@@ -64,6 +80,12 @@ pub fn run() -> Result<()> {
             }
         })
         .ok_or("No DRM device with a usable connected output on the active seat")?;
+
+    if let Some((width, height)) = requested_size
+        && kms.mode.size() != (width, height)
+    {
+        eprintln!("Could not use requested display size {width}x{height}; using a fallback mode");
+    }
 
     let mut input = Libinput::new_with_udev(LibinputSessionInterface::from(session.clone()));
     input
@@ -81,6 +103,23 @@ pub fn run() -> Result<()> {
     )?;
     state.advertise_dmabuf(&kms.renderer);
     state.native_session = true;
+    match crate::notification_bus::Service::start(state.notifications.clone()) {
+        Ok(service) => {
+            state.notifications_available = true;
+            let interval = std::time::Duration::from_millis(80);
+            handle.insert_source(Timer::from_duration(interval), move |_, _, native| {
+                let state = &mut native.state;
+                let now = Instant::now();
+                let private = state.notifications_private(now);
+                let privacy_changed = state.notifications.borrow_mut().set_private(private);
+                if (service.dispatch(&state.notifications, now) || privacy_changed) && !private {
+                    state.redraw = true;
+                }
+                TimeoutAction::ToDuration(interval)
+            })?;
+        }
+        Err(error) => eprintln!("Notifications unavailable: {error}"),
+    }
     let x11 = match crate::desktop::x11::X11::start(&server.socket) {
         Ok(x11) => Some(x11),
         Err(error) if error.kind() == io::ErrorKind::NotFound => None,
@@ -90,12 +129,13 @@ pub fn run() -> Result<()> {
         }
     };
     let _services = crate::desktop::Services::start(&server.socket, x11.as_ref());
+    let metrics = FrameMetrics::new("native DRM", Some(Mode::from(kms.mode).refresh));
     let mut native = Native {
         kms,
         state,
         session,
         input: input.clone(),
-        metrics: FrameMetrics::new("native DRM"),
+        metrics,
         pending_flip: false,
         pending_lock_frame: false,
         x11,
@@ -249,7 +289,11 @@ struct Kms {
 }
 
 impl Kms {
-    fn open(session: &mut LibSeatSession, path: &Path) -> Result<(Self, DrmDeviceNotifier)> {
+    fn open(
+        session: &mut LibSeatSession,
+        path: &Path,
+        requested_size: Option<(u16, u16)>,
+    ) -> Result<(Self, DrmDeviceNotifier)> {
         let fd = session.open(path, OFlags::RDWR | OFlags::CLOEXEC | OFlags::NONBLOCK)?;
         let fd = DrmDeviceFd::new(DeviceFd::from(fd));
         let (mut drm, events) = DrmDevice::new(fd.clone(), false)?;
@@ -270,10 +314,23 @@ impl Kms {
                     .into_owned()
             }
         })?;
-        let scene = Scene::new(&mut renderer, true)?;
+        let driver = path
+            .file_name()
+            .and_then(|card| {
+                std::fs::read_link(Path::new("/sys/class/drm").join(card).join("device/driver"))
+                    .ok()
+            })
+            .and_then(|path| {
+                path.file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+            })
+            .unwrap_or_else(|| "unknown".into());
+        let profile = Profile::from_environment();
+        let safe_graphics = profile.safe(&driver, &renderer_name);
+        let scene = Scene::new(&mut renderer, true, safe_graphics)?;
         let formats = renderer.egl_context().display().dmabuf_render_formats();
         let mut failure = None;
-        for (connector, crtc, mode) in connected_outputs(&drm)? {
+        for (connector, crtc, mode) in connected_outputs(&drm, requested_size)? {
             let surface = match drm.create_surface(crtc, mode, &[connector.handle()]) {
                 Ok(surface) => surface,
                 Err(error) => {
@@ -301,6 +358,9 @@ impl Kms {
                         .size()
                         .map_or((0, 0), |(w, h)| (w as i32, h as i32));
                     println!("DRM device: {}", path.display());
+                    println!(
+                        "DRM driver: {driver}; graphics profile: {profile:?} (safe effects: {safe_graphics})"
+                    );
                     return Ok((
                         Self {
                             scanout,
@@ -335,6 +395,7 @@ impl Kms {
         let start = metrics.start();
         let (mut buffer, _) = self.scanout.next_buffer()?;
         let mut target = self.renderer.bind(&mut buffer)?;
+        let draw_start = metrics.start();
         let size = Mode::from(self.mode).size;
         let shell_scale = (f64::from(size.h) / 1080.0).clamp(1.0, 2.0);
         let sync = self.scene.draw(
@@ -347,12 +408,15 @@ impl Kms {
         )?;
         let submit_start = metrics.start();
         self.scanout.queue_buffer(Some(sync), None, ())?;
-        metrics.submitted(start, submit_start);
+        metrics.submitted(start, draw_start, submit_start);
         Ok(())
     }
 }
 
-fn connected_outputs(drm: &DrmDevice) -> Result<Vec<(connector::Info, crtc::Handle, DrmMode)>> {
+fn connected_outputs(
+    drm: &DrmDevice,
+    requested_size: Option<(u16, u16)>,
+) -> Result<Vec<(connector::Info, crtc::Handle, DrmMode)>> {
     let resources = drm.resource_handles()?;
     let mut outputs = Vec::new();
     for &handle in resources.connectors() {
@@ -388,14 +452,24 @@ fn connected_outputs(drm: &DrmDevice) -> Result<Vec<(connector::Info, crtc::Hand
             }
         }
     }
+    if let Some(size) = requested_size {
+        // Keep the normal connector and mode order within each group.
+        outputs.sort_by_key(|(_, _, mode)| mode.size() != size);
+    }
     Ok(outputs)
 }
 
-fn mode_priority(mode: Mode, preferred: bool) -> (i64, i32, bool) {
+fn parse_display_size(value: &str) -> Option<(u16, u16)> {
+    let (width, height) = value.split_once('x')?;
+    let size = (width.parse().ok()?, height.parse().ok()?);
+    (size.0 > 0 && size.1 > 0).then_some(size)
+}
+
+fn mode_priority(mode: Mode, preferred: bool) -> (bool, i64, i32) {
     (
+        preferred,
         i64::from(mode.size.w) * i64::from(mode.size.h),
         mode.refresh,
-        preferred,
     )
 }
 
@@ -404,7 +478,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn larger_modes_rank_before_faster_small_modes() {
+    fn display_size_requires_two_positive_dimensions() {
+        assert_eq!(parse_display_size("1920x1080"), Some((1920, 1080)));
+        for value in ["1920", "1920x0", "-1x1080", "1920x1080@60", "65536x1080"] {
+            assert_eq!(parse_display_size(value), None, "{value}");
+        }
+    }
+    #[test]
+    fn preferred_modes_rank_before_larger_modes() {
         let large = Mode {
             size: (3840, 2160).into(),
             refresh: 60_000,
@@ -413,11 +494,11 @@ mod tests {
             size: (1920, 1080).into(),
             refresh: 144_000,
         };
-        assert!(mode_priority(large, false) > mode_priority(small, true));
+        assert!(mode_priority(small, true) > mode_priority(large, false));
     }
 
     #[test]
-    fn refresh_breaks_size_ties_and_preferred_breaks_refresh_ties() {
+    fn refresh_breaks_size_ties_and_preferred_takes_priority() {
         let slow = Mode {
             size: (1920, 1080).into(),
             refresh: 60_000,
@@ -426,7 +507,7 @@ mod tests {
             size: (1920, 1080).into(),
             refresh: 144_000,
         };
-        assert!(mode_priority(fast, false) > mode_priority(slow, true));
+        assert!(mode_priority(fast, false) > mode_priority(slow, false));
         assert!(mode_priority(fast, true) > mode_priority(fast, false));
     }
 }

@@ -6,14 +6,17 @@ const BATCH_SIZE: usize = 300;
 pub struct FrameMetrics {
     backend: &'static str,
     enabled: bool,
-    preparation: Vec<Duration>,
+    binding: Vec<Duration>,
+    drawing: Vec<Duration>,
     submission: Vec<Duration>,
     presentation: Vec<Duration>,
     pending: Option<Instant>,
+    frame_budget: Option<Duration>,
+    over_budget: usize,
 }
 
 impl FrameMetrics {
-    pub fn new(backend: &'static str) -> Self {
+    pub fn new(backend: &'static str, refresh: Option<i32>) -> Self {
         let enabled = std::env::var_os("VANTAGE_FRAME_METRICS").is_some_and(|v| v == "1");
         if enabled {
             eprintln!(
@@ -23,10 +26,15 @@ impl FrameMetrics {
         Self {
             backend,
             enabled,
-            preparation: Vec::new(),
+            binding: Vec::new(),
+            drawing: Vec::new(),
             submission: Vec::new(),
             presentation: Vec::new(),
             pending: None,
+            frame_budget: refresh
+                .filter(|&refresh| refresh > 0)
+                .map(|refresh| Duration::from_nanos(1_000_000_000_000 / refresh as u64)),
+            over_budget: 0,
         }
     }
 
@@ -34,14 +42,28 @@ impl FrameMetrics {
         self.enabled.then(Instant::now)
     }
 
-    pub fn submitted(&mut self, start: Option<Instant>, submit_start: Option<Instant>) {
-        if let (Some(start), Some(submit_start)) = (start, submit_start) {
+    pub fn submitted(
+        &mut self,
+        start: Option<Instant>,
+        draw_start: Option<Instant>,
+        submit_start: Option<Instant>,
+    ) {
+        if let (Some(start), Some(draw_start), Some(submit_start)) =
+            (start, draw_start, submit_start)
+        {
             let now = Instant::now();
-            self.preparation.push(submit_start.duration_since(start));
+            self.binding.push(draw_start.duration_since(start));
+            self.drawing.push(submit_start.duration_since(draw_start));
             self.submission.push(now.duration_since(submit_start));
+            if self
+                .frame_budget
+                .is_some_and(|budget| now.duration_since(start) > budget)
+            {
+                self.over_budget += 1;
+            }
             if self.backend == "native DRM" {
                 self.pending = Some(now);
-            } else if self.preparation.len() == BATCH_SIZE {
+            } else if self.drawing.len() == BATCH_SIZE {
                 self.report();
             }
         }
@@ -50,7 +72,7 @@ impl FrameMetrics {
     pub fn presented(&mut self) {
         if let Some(submitted) = self.pending.take() {
             self.presentation.push(submitted.elapsed());
-            if self.preparation.len() == BATCH_SIZE {
+            if self.drawing.len() == BATCH_SIZE {
                 self.report();
             }
         }
@@ -58,29 +80,38 @@ impl FrameMetrics {
 
     pub fn cancel_pending(&mut self) {
         self.pending = None;
-        if self.preparation.len() == BATCH_SIZE {
+        if self.drawing.len() == BATCH_SIZE {
             self.report();
         }
     }
 
     fn report(&mut self) {
-        if self.preparation.is_empty() {
+        if self.drawing.is_empty() {
             return;
         }
         eprintln!(
             "Frame metrics ({}): {} submitted frames",
             self.backend,
-            self.preparation.len()
+            self.drawing.len()
         );
-        print_stats("CPU preparation", &mut self.preparation);
+        print_stats("CPU buffer bind", &mut self.binding);
+        print_stats("CPU scene draw", &mut self.drawing);
         print_stats("CPU submission", &mut self.submission);
         if self.presentation.is_empty() {
             eprintln!("  DRM callback latency: unavailable");
         } else {
             print_stats("DRM submit-to-callback latency", &mut self.presentation);
         }
-        eprintln!("  Hardware presentation times, missed intervals and effect costs: unavailable");
-        self.preparation.clear();
+        if let Some(budget) = self.frame_budget {
+            eprintln!(
+                "  CPU frames over {:.3} ms mode interval: {}",
+                budget.as_secs_f64() * 1000.0,
+                self.over_budget,
+            );
+        }
+        self.over_budget = 0;
+        self.binding.clear();
+        self.drawing.clear();
         self.submission.clear();
         self.presentation.clear();
     }

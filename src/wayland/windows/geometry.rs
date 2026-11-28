@@ -3,16 +3,16 @@ use std::cell::RefCell;
 use smithay::{
     desktop::Window,
     reexports::wayland_protocols::xdg::shell::server::xdg_toplevel,
-    reexports::wayland_server::Resource,
+    reexports::wayland_server::{Resource, protocol::wl_output::WlOutput},
     utils::{Logical, Point, Rectangle, Serial, Size},
     wayland::{
         compositor::with_states,
-        shell::xdg::{SurfaceCachedState, ToplevelSurface},
+        shell::xdg::{SurfaceCachedState, ToplevelSurface, XdgToplevelSurfaceData},
     },
 };
 
-use super::{BUTTON_LEFT, State};
-use crate::shell::{dock::DOCK_RESERVE, status::BAR_HEIGHT};
+use super::{BUTTON_LEFT, State, fullscreen::Fullscreen};
+use crate::shell::status::BAR_HEIGHT;
 
 pub(super) use xdg_toplevel::{ResizeEdge, WmCapabilities};
 
@@ -55,6 +55,7 @@ struct Geometry {
     restore_pending: bool,
     restore_in_place: bool,
     resize: Option<Resize>,
+    fullscreen: Fullscreen<Rectangle<i32, Logical>, Serial>,
 }
 
 fn geometry(window: &Window) -> &RefCell<Geometry> {
@@ -68,7 +69,20 @@ fn geometry(window: &Window) -> &RefCell<Geometry> {
 }
 
 pub(super) fn has_maximized_geometry(window: &Window) -> bool {
-    geometry(window).borrow().restore.is_some()
+    let placement = geometry(window).borrow();
+    placement.restore.is_some() || placement.fullscreen.saved.is_some()
+}
+
+pub(super) fn fullscreen_pending(window: &Window) -> bool {
+    geometry(window).borrow().fullscreen.saved.is_some() || is_fullscreen(window)
+}
+
+pub(super) fn is_fullscreen(window: &Window) -> bool {
+    window.toplevel().is_some_and(|top| {
+        top.current_state()
+            .states
+            .contains(xdg_toplevel::State::Fullscreen)
+    })
 }
 
 pub(super) fn can_place(window: &Window, layout: Layout, area: Rectangle<i32, Logical>) -> bool {
@@ -87,6 +101,77 @@ pub(super) fn can_place(window: &Window, layout: Layout, area: Rectangle<i32, Lo
 }
 
 impl State {
+    pub(super) fn set_fullscreen(
+        &mut self,
+        top: &ToplevelSurface,
+        fullscreen: bool,
+        output: Option<WlOutput>,
+    ) {
+        let Some((index, window)) = self.find_window(top.wl_surface()) else {
+            return;
+        };
+        let Some(area) = self.spaces[index].output_geometry(&self.output) else {
+            return;
+        };
+        let Some(location) = self.spaces[index].element_location(&window) else {
+            return;
+        };
+        if self.resizing_window.as_ref() == Some(&window) {
+            self.finish_resize();
+        }
+        if self
+            .dragged_window
+            .as_ref()
+            .is_some_and(|drag| drag.window == window)
+        {
+            self.dragged_window = None;
+        }
+        let mut placement = geometry(&window).borrow_mut();
+        let layout = placement.layout;
+        if fullscreen {
+            let current = Rectangle::new(location, window.geometry().size);
+            // A floating restore may still be waiting on its own configure.
+            let saved = if placement.restore_pending {
+                placement.restore.unwrap_or(current)
+            } else {
+                current
+            };
+            placement.fullscreen.enter(saved);
+            placement.resize = None;
+        } else {
+            placement.fullscreen.requested = false;
+        }
+        let saved = placement.fullscreen.saved;
+        use xdg_toplevel::State as Xdg;
+        top.with_pending_state(|state| {
+            if fullscreen {
+                state.states.set(Xdg::Fullscreen);
+                state.size = Some(area.size);
+                state.fullscreen_output = output.filter(|output| self.output.owns(output));
+            } else if state.states.unset(Xdg::Fullscreen) {
+                state.fullscreen_output = None;
+                state.size = if layout == Layout::Floating {
+                    saved
+                        .filter(|rect| !rect.size.is_empty())
+                        .map(|rect| rect.size)
+                } else {
+                    self.work_area(index).map(|area| layout.bounds(area).size)
+                };
+            }
+        });
+        if top.is_initial_configure_sent() {
+            let serial = top.send_configure();
+            if !fullscreen && saved.is_some() {
+                placement.fullscreen.exit = Some(serial);
+            }
+        } else if !fullscreen {
+            placement.fullscreen = Fullscreen::default();
+        }
+        self.opening_windows
+            .retain(|(opening, _)| opening != &window);
+        self.redraw = true;
+    }
+
     pub(super) fn restore_for_drag(&mut self, window: &Window) -> Option<Size<i32, Logical>> {
         let placement = geometry(window).borrow();
         if placement.layout == Layout::Floating {
@@ -236,6 +321,12 @@ impl State {
 
     pub(super) fn place_window(&mut self, window: &Window, layout: Layout) {
         let top = window.toplevel().expect("Wayland window");
+        if fullscreen_pending(window) {
+            if top.is_initial_configure_sent() {
+                top.send_configure();
+            }
+            return;
+        }
         let Some((index, _)) = self.find_window(top.wl_surface()) else {
             return;
         };
@@ -324,7 +415,46 @@ impl State {
         } else {
             Layout::Floating
         };
-        let location = if committed != Layout::Floating {
+        let location = if state.states.contains(Xdg::Fullscreen) {
+            self.spaces[index]
+                .output_geometry(&self.output)
+                .map(|area| {
+                    let size = window.geometry().size;
+                    area.loc
+                        + Point::from((
+                            (area.size.w - size.w).max(0) / 2,
+                            (area.size.h - size.h).max(0) / 2,
+                        ))
+                })
+        } else if let Some(saved) =
+            placement
+                .fullscreen
+                .restore(with_states(top.wl_surface(), |states| {
+                    states
+                        .data_map
+                        .get::<XdgToplevelSurfaceData>()?
+                        .lock()
+                        .ok()?
+                        .current_serial
+                }))
+        {
+            if committed == Layout::Floating {
+                if placement.restore_pending {
+                    placement.restore = None;
+                    placement.restore_pending = false;
+                    placement.restore_in_place = false;
+                }
+                if saved.size.is_empty() {
+                    self.spaces[index]
+                        .output_geometry(&self.output)
+                        .map(|area| super::centered_location(window, area.size))
+                } else {
+                    Some(clamp_location(saved, self.work_area(index)))
+                }
+            } else {
+                self.work_area(index).map(|area| committed.bounds(area).loc)
+            }
+        } else if committed != Layout::Floating {
             if placement.restore_in_place {
                 None
             } else {
@@ -338,18 +468,7 @@ impl State {
                 .restore
                 .take()
                 .filter(|rect| !restore_in_place && !rect.size.is_empty())
-                .map(|rect| {
-                    let Some(area) = self.work_area(index) else {
-                        return rect.loc;
-                    };
-                    let max_x = area.loc.x + (area.size.w - rect.size.w).max(0);
-                    let max_y = area.loc.y + (area.size.h - rect.size.h).max(0);
-                    (
-                        rect.loc.x.clamp(area.loc.x, max_x),
-                        rect.loc.y.clamp(area.loc.y, max_y),
-                    )
-                        .into()
-                })
+                .map(|rect| clamp_location(rect, self.work_area(index)))
         } else if let Some(resize) = placement.resize {
             let size = window.geometry().size;
             let mut point = resize.original.loc;
@@ -387,6 +506,14 @@ impl State {
         if self.resizing_window.as_ref() == Some(window) {
             self.resizing_window = None;
         }
+        if self
+            .dragged_window
+            .as_ref()
+            .is_some_and(|drag| &drag.window == window)
+        {
+            self.dragged_window = None;
+        }
+        *geometry(window).borrow_mut() = Geometry::default();
     }
 
     pub(super) fn refresh_maximized_windows(&mut self) {
@@ -396,11 +523,17 @@ impl State {
             };
             for window in self.spaces[index].elements() {
                 let placement = geometry(window).borrow();
-                if placement.layout != Layout::Floating
+                if (placement.fullscreen.requested || placement.layout != Layout::Floating)
                     && let Some(top) = window.toplevel()
                 {
                     top.with_pending_state(|state| {
-                        state.size = Some(placement.layout.bounds(area).size)
+                        state.size = if placement.fullscreen.requested {
+                            self.spaces[index]
+                                .output_geometry(&self.output)
+                                .map(|output| output.size)
+                        } else {
+                            Some(placement.layout.bounds(area).size)
+                        };
                     });
                     if top.is_initial_configure_sent() {
                         top.send_pending_configure();
@@ -413,15 +546,29 @@ impl State {
     pub(super) fn work_area(&self, index: usize) -> Option<Rectangle<i32, Logical>> {
         let output = self.spaces[index].output_geometry(&self.output)?;
         let top = self
-            .status_hits
-            .map_or(BAR_HEIGHT as i32, |(bar, _)| bar.size.h)
+            .bar_height
+            .unwrap_or(BAR_HEIGHT as i32)
             .min(output.size.h - 1);
-        let height = (output.size.h - top - DOCK_RESERVE).max(1);
+        let height = (output.size.h - top - self.dock_reserve).max(1);
         Some(Rectangle::new(
             (0, top).into(),
             (output.size.w, height).into(),
         ))
     }
+}
+
+fn clamp_location(
+    rect: Rectangle<i32, Logical>,
+    area: Option<Rectangle<i32, Logical>>,
+) -> Point<i32, Logical> {
+    let Some(area) = area else { return rect.loc };
+    let max_x = area.loc.x + (area.size.w - rect.size.w).max(0);
+    let max_y = area.loc.y + (area.size.h - rect.size.h).max(0);
+    (
+        rect.loc.x.clamp(area.loc.x, max_x),
+        rect.loc.y.clamp(area.loc.y, max_y),
+    )
+        .into()
 }
 
 fn bounded(value: i32, min: i32, max: i32) -> i32 {

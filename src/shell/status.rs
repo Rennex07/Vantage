@@ -21,6 +21,7 @@ const ROW_HEIGHT: f64 = 43.0;
 const WORKSPACE_X: f64 = 177.0;
 const WORKSPACE_STEP: f64 = 35.0;
 const SETTINGS_WIDTH: f64 = 110.0;
+const ALERTS_WIDTH: f64 = 54.0;
 const OVERVIEW_X: f64 = 291.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -34,6 +35,12 @@ pub enum Action {
     Shutdown,
     Logout,
     Cancel,
+    Notifications,
+    NotificationQuiet,
+    NotificationClear,
+    NotificationPage(isize),
+    NotificationDismiss(u32),
+    NotificationInvoke(u32, usize, u64),
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -44,6 +51,7 @@ pub enum Panel {
     Power,
     Shutdown,
     Logout,
+    Notifications,
 }
 
 impl Panel {
@@ -51,8 +59,12 @@ impl Panel {
         self != Self::Closed
     }
 
-    fn size(self) -> (i32, i32) {
-        (PANEL_WIDTH, if self == Self::Settings { 294 } else { 202 })
+    pub(super) fn size(self) -> (i32, i32) {
+        match self {
+            Self::Settings => (PANEL_WIDTH, 294),
+            Self::Notifications => super::notifications::SIZE,
+            _ => (PANEL_WIDTH, 202),
+        }
     }
 }
 
@@ -179,6 +191,7 @@ pub struct View {
     pub hovered: Option<Action>,
     pub overview: bool,
     pub native: bool,
+    pub notifications: bool,
     pub error: Option<&'static str>,
     pub solid: bool,
 }
@@ -227,7 +240,9 @@ impl StatusBar {
 }
 
 pub fn bounds(width: i32, scale: f64) -> Rectangle<i32, Physical> {
-    let height = (BAR_HEIGHT * scale).round().clamp(32.0, 84.0) as i32;
+    let height = (BAR_HEIGHT * scale * super::CHROME_SCALE)
+        .clamp(32.0, 84.0 * super::CHROME_SCALE)
+        .round() as i32;
     Rectangle::from_size((width, height).into())
 }
 
@@ -270,6 +285,9 @@ pub fn action_at(
         let y = point.y / scale;
         if x >= width - SETTINGS_WIDTH {
             return Some(Action::Toggle);
+        }
+        if native && width >= 500.0 && x >= width - SETTINGS_WIDTH - ALERTS_WIDTH {
+            return Some(Action::Notifications);
         }
         if x < 158.0 {
             return Some(Action::Launch(Tool::Apps));
@@ -419,6 +437,17 @@ fn paint(context: &Context, size: Size<i32, Physical>, view: &View) -> Result<()
             width / 2.0,
             26.0,
         )?;
+    }
+    if view.notifications && width >= 500.0 {
+        let x = width - SETTINGS_WIDTH - ALERTS_WIDTH;
+        if view.panel == Panel::Notifications || view.hovered == Some(Action::Notifications) {
+            theme::rounded(context, (x, 5.0, ALERTS_WIDTH - 4.0, 32.0), 8.0);
+            theme::ink(context, colors.accent, 0.16);
+            context.fill()?;
+        }
+        theme::ink(context, colors.text, 1.0);
+        theme::font(context, 12.0, FontWeight::Normal);
+        centered(context, "Alerts", x + (ALERTS_WIDTH - 4.0) / 2.0, 25.0)?;
     }
 
     if view.panel.open() || view.hovered == Some(Action::Toggle) {
@@ -769,14 +798,19 @@ mod tests {
         let bar = bounds(1280, 1.5);
         let popup = panel_bounds(output, bar, Panel::Settings);
         let hits = (bar, popup);
-        let network = (f64::from(popup.loc.x) + 30.0, f64::from(popup.loc.y) + 82.0).into();
+        assert_eq!(bar.size.h, 71);
+        let network = (
+            f64::from(popup.loc.x) + 35.0,
+            f64::from(popup.loc.y) + 100.0,
+        )
+            .into();
         let power = (
-            f64::from(popup.loc.x) + 30.0,
-            f64::from(popup.loc.y) + 334.0,
+            f64::from(popup.loc.x) + 35.0,
+            f64::from(popup.loc.y) + 390.0,
         )
             .into();
         assert_eq!(
-            action_at(hits, (335.0, 29.0).into(), Panel::Closed, true),
+            action_at(hits, (382.0, 34.0).into(), Panel::Closed, true),
             Some(Action::Workspace(1))
         );
         assert_eq!(action_at(hits, network, Panel::Closed, true), None);

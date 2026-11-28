@@ -120,6 +120,7 @@ impl State {
                 );
             }
             self.intercepted_keys.clear();
+            self.cancel_lock_pointer_wake();
         }
     }
 
@@ -162,19 +163,19 @@ impl State {
                     serial,
                     event.time_msec(),
                     |data, modifiers, key| {
-                        let pressed = state == KeyState::Pressed;
-                        if pressed {
-                            data.intercepted_keys.insert(code.raw());
+                        let new_press = if state == KeyState::Pressed {
+                            data.intercepted_keys.insert(code.raw())
                         } else {
                             data.intercepted_keys.remove(&code.raw());
-                        }
+                            false
+                        };
                         let symbol = key.modified_sym();
                         let character = if modifiers.ctrl || modifiers.logo {
                             None
                         } else {
                             symbol.key_char()
                         };
-                        FilterResult::Intercept(pressed.then_some((symbol.raw(), character)))
+                        FilterResult::Intercept(new_press.then_some((symbol.raw(), character)))
                     },
                 );
                 if let Some(Some((symbol, character))) = key {
@@ -234,6 +235,14 @@ impl State {
                                 true
                             } else if overview_shortcut {
                                 data.toggle_overview();
+                                true
+                            } else if data.notifications_available
+                                && modifiers.logo
+                                && !modifiers.ctrl
+                                && !modifiers.alt
+                                && symbol == keysyms::KEY_n
+                            {
+                                data.apply_status_action(Action::Notifications, &open_tool);
                                 true
                             } else if modifiers.logo
                                 && !modifiers.ctrl
@@ -352,7 +361,7 @@ impl State {
                 };
                 let location = event.position_transformed(output.size);
                 self.move_pointer(location, serial, event.time_msec());
-                self.redraw |= shortcut.is_some();
+                self.redraw |= shortcut.is_some() && !self.lock_active();
             }
             InputEvent::PointerMotion { event } => {
                 let Some(output) =
@@ -366,7 +375,7 @@ impl State {
                     location.y.clamp(0.0, f64::from(output.size.h - 1)),
                 ));
                 self.move_pointer(location, serial, event.time_msec());
-                self.redraw |= shortcut.is_some();
+                self.redraw |= shortcut.is_some() && !self.lock_active();
             }
             InputEvent::PointerButton { event } => {
                 let location = pointer.current_location();
@@ -500,6 +509,35 @@ impl State {
     fn apply_status_action(&mut self, action: Action, open: impl FnOnce(Tool) -> io::Result<()>) {
         self.status_error = None;
         match action {
+            Action::Notifications
+                if self.notifications_available && !self.notifications_private(Instant::now()) =>
+            {
+                if self.status_panel == Panel::Notifications {
+                    self.status_panel = Panel::Closed;
+                } else {
+                    if self.overview.open {
+                        self.toggle_overview();
+                    }
+                    self.notification_page = 0;
+                    self.status_panel = Panel::Notifications;
+                }
+            }
+            Action::NotificationQuiet => self.notifications.borrow_mut().toggle_quiet(),
+            Action::NotificationClear => self.notifications.borrow_mut().clear(),
+            Action::NotificationPage(delta) => {
+                self.notification_page = self
+                    .notification_page
+                    .saturating_add_signed(delta)
+                    .min(self.notifications.borrow().pages() - 1);
+            }
+            Action::NotificationDismiss(id) => self.notifications.borrow_mut().dismiss(id),
+            Action::NotificationInvoke(id, index, revision) => {
+                let mut center = self.notifications.borrow_mut();
+                if center.revision() == revision {
+                    center.invoke(id, index);
+                }
+            }
+            Action::Notifications => (),
             Action::Overview => self.toggle_overview(),
             Action::Power => self.status_panel = Panel::Power,
             Action::Lock => {

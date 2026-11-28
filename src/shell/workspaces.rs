@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use super::timeline::{Ease, Transition};
+use super::timeline::{Animation, Ease};
 
 pub const WORKSPACE_COUNT: usize = 3;
 const SWITCH: Duration = Duration::from_millis(300);
@@ -8,7 +8,7 @@ const SWITCH: Duration = Duration::from_millis(300);
 #[derive(Default)]
 pub struct Workspaces {
     pub active: usize,
-    slide: Option<Transition>,
+    slide: Animation,
 }
 
 impl Workspaces {
@@ -16,28 +16,29 @@ impl Workspaces {
         if index >= WORKSPACE_COUNT || index == self.active {
             return;
         }
-        self.slide = animate
-            .then(|| Transition::new(self.position(now), index as f64, now, SWITCH, Ease::Smooth));
+        self.slide.retarget(
+            index as f64,
+            now,
+            if animate { SWITCH } else { Duration::ZERO },
+            Ease::Smooth,
+        );
         self.active = index;
     }
 
     pub fn position(&self, now: Instant) -> f64 {
-        let target = self.active as f64;
-        self.slide.as_ref().map_or(target, |slide| slide.value(now))
+        self.slide.value(now)
     }
 
     pub fn is_animating(&self) -> bool {
-        self.slide.is_some()
+        self.slide.is_animating()
     }
 
     pub fn finish_frame(&mut self, now: Instant) {
-        if self.slide.as_ref().is_some_and(|slide| slide.finished(now)) {
-            self.slide = None;
-        }
+        self.slide.finish_frame(now);
     }
 
     pub fn settle(&mut self) {
-        self.slide = None;
+        self.slide.settle();
     }
 }
 
