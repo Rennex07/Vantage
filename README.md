@@ -95,7 +95,10 @@ Log in as a regular user at a local Linux virtual terminal and run:
 
 The session uses libseat to access graphics and input devices on the
 active seat. It checks the primary GPU first, then other GPUs on the seat,
-and selects one connected output and a supported mode. On startup it
+and selects one connected output. Vantage tries the largest resolution first,
+then the highest refresh at that resolution, and falls back if the driver
+cannot activate a mode. The dock and top controls scale up on tall,
+high-resolution outputs. On startup it
 reports the DRM device, output, GLES renderer, logical CPUs available
 to the process, and Wayland socket. Hardware rendering depends on the
 installed driver and graphics device. A renderer line containing `llvmpipe`

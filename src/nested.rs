@@ -1,4 +1,7 @@
-use std::{error::Error, time::Instant};
+use std::{
+    error::Error,
+    time::{Duration, Instant},
+};
 
 use smithay::{
     backend::{
@@ -15,7 +18,7 @@ use smithay::{
 use crate::{
     frame_metrics::FrameMetrics,
     session::{Scene, Server},
-    shell::{dock::FRAME_INTERVAL, launch},
+    shell::launch,
     wayland::State,
 };
 
@@ -39,8 +42,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     handle.insert_source(events, move |event, _, state| match event {
         WinitEvent::CloseRequested => state.closed = true,
         WinitEvent::Redraw => state.redraw = true,
-        WinitEvent::Resized { size, .. } => {
-            state.resize_output(size);
+        WinitEvent::Resized { .. } => {
             state.redraw = true;
         }
         WinitEvent::Focus(focused) => state.host_focus(focused),
@@ -64,6 +66,8 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             next_frame = None;
         }
         server.dispatch(&mut state)?;
+        let refresh = host_refresh(backend.window());
+        state.resize_output(backend.window_size(), refresh);
         if std::mem::take(&mut state.redraw) {
             let size = backend.window_size();
             if size.w == 0 || size.h == 0 {
@@ -88,7 +92,9 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                 backend.submit(Some(&[Rectangle::from_size(size)]))?;
                 metrics.submitted(start, submit_start);
                 state.frame_presented(Instant::now(), false);
-                next_frame = scene.is_animating(&state).then_some(now + FRAME_INTERVAL);
+                next_frame = scene
+                    .is_animating(&state)
+                    .then_some(now + frame_interval(refresh));
             }
         }
         server.flush()?;
@@ -98,4 +104,28 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         )?;
     }
     Ok(())
+}
+
+fn host_refresh(window: &Window) -> i32 {
+    window
+        .current_monitor()
+        .and_then(|monitor| monitor.refresh_rate_millihertz())
+        .and_then(|refresh| i32::try_from(refresh).ok())
+        .filter(|&refresh| refresh > 0)
+        .unwrap_or(60_000)
+}
+
+fn frame_interval(refresh: i32) -> Duration {
+    Duration::from_nanos(1_000_000_000_000 / refresh as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frame_interval_tracks_host_refresh() {
+        assert_eq!(frame_interval(60_000), Duration::from_nanos(16_666_666));
+        assert_eq!(frame_interval(144_000), Duration::from_nanos(6_944_444));
+    }
 }

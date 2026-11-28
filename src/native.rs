@@ -1,4 +1,6 @@
-use std::{error::Error, ffi::CStr, io, os::unix::net::UnixStream, path::Path, time::Instant};
+use std::{
+    cmp::Reverse, error::Error, ffi::CStr, io, os::unix::net::UnixStream, path::Path, time::Instant,
+};
 
 use signal_hook::{
     consts::{SIGINT, SIGTERM},
@@ -157,9 +159,10 @@ pub fn run() -> Result<()> {
     )?;
 
     println!(
-        "Vantage on {seat}, {} {} ({}), {} logical CPUs available",
+        "Vantage on {seat}, {} {} at {:.2} Hz ({}), {} logical CPUs available",
         native.kms.name,
         native.kms.mode.name().to_string_lossy(),
+        f64::from(Mode::from(native.kms.mode).refresh) / 1000.0,
         native.kms.renderer_name,
         std::thread::available_parallelism().map_or(1, |count| count.get()),
     );
@@ -332,13 +335,15 @@ impl Kms {
         let start = metrics.start();
         let (mut buffer, _) = self.scanout.next_buffer()?;
         let mut target = self.renderer.bind(&mut buffer)?;
+        let size = Mode::from(self.mode).size;
+        let shell_scale = (f64::from(size.h) / 1080.0).clamp(1.0, 2.0);
         let sync = self.scene.draw(
             state,
             &mut self.renderer,
             &mut target,
-            Mode::from(self.mode).size,
+            size,
             Transform::Normal,
-            1.0,
+            shell_scale,
         )?;
         let submit_start = metrics.start();
         self.scanout.queue_buffer(Some(sync), None, ())?;
@@ -371,7 +376,12 @@ fn connected_outputs(drm: &DrmDevice) -> Result<Vec<(connector::Info, crtc::Hand
             }
         }
         let mut modes = connector.modes().to_vec();
-        modes.sort_by_key(|mode| !mode.mode_type().contains(ModeTypeFlags::PREFERRED));
+        modes.sort_by_cached_key(|mode| {
+            Reverse(mode_priority(
+                (*mode).into(),
+                mode.mode_type().contains(ModeTypeFlags::PREFERRED),
+            ))
+        });
         for mode in modes {
             for &crtc in &crtcs {
                 outputs.push((connector.clone(), crtc, mode));
@@ -379,4 +389,44 @@ fn connected_outputs(drm: &DrmDevice) -> Result<Vec<(connector::Info, crtc::Hand
         }
     }
     Ok(outputs)
+}
+
+fn mode_priority(mode: Mode, preferred: bool) -> (i64, i32, bool) {
+    (
+        i64::from(mode.size.w) * i64::from(mode.size.h),
+        mode.refresh,
+        preferred,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn larger_modes_rank_before_faster_small_modes() {
+        let large = Mode {
+            size: (3840, 2160).into(),
+            refresh: 60_000,
+        };
+        let small = Mode {
+            size: (1920, 1080).into(),
+            refresh: 144_000,
+        };
+        assert!(mode_priority(large, false) > mode_priority(small, true));
+    }
+
+    #[test]
+    fn refresh_breaks_size_ties_and_preferred_breaks_refresh_ties() {
+        let slow = Mode {
+            size: (1920, 1080).into(),
+            refresh: 60_000,
+        };
+        let fast = Mode {
+            size: (1920, 1080).into(),
+            refresh: 144_000,
+        };
+        assert!(mode_priority(fast, false) > mode_priority(slow, true));
+        assert!(mode_priority(fast, true) > mode_priority(fast, false));
+    }
 }

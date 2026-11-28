@@ -29,7 +29,6 @@ use super::{
 };
 
 const REVEAL: Duration = Duration::from_millis(336);
-pub const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 pub const DOCK_RESERVE: i32 = 86;
 const BASE_WIDTH: f64 = 146.0;
 const HEIGHT: f64 = 72.0;

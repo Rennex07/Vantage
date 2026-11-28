@@ -343,11 +343,8 @@ impl State {
         }
     }
 
-    pub fn resize_output(&mut self, size: Size<i32, Physical>) {
-        self.set_output_mode(Mode {
-            size,
-            refresh: 60_000,
-        });
+    pub fn resize_output(&mut self, size: Size<i32, Physical>, refresh: i32) {
+        self.set_output_mode(Mode { size, refresh });
     }
 
     fn set_output_mode(&mut self, mode: Mode) {
@@ -364,7 +361,10 @@ impl State {
         if let Some(previous) = previous {
             self.output.delete_mode(previous);
         }
-        self.center_windows();
+        if previous.is_none_or(|previous| previous.size != mode.size) {
+            self.center_windows();
+        }
+        self.redraw = true;
     }
 }
 
