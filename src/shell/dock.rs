@@ -8,7 +8,7 @@ use smithay::{
     backend::{
         allocator::Fourcc,
         renderer::{
-            Frame, ImportMem, Texture,
+            ImportMem, Texture,
             gles::{
                 GlesError, GlesFrame, GlesRenderer, GlesTexProgram, GlesTexture, Uniform,
                 UniformName, UniformType,

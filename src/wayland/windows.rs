@@ -45,6 +45,7 @@ pub(super) struct WindowDrag {
 
 impl State {
     pub(super) fn surface_committed(&mut self, surface: &WlSurface) {
+        self.surface_epoch = self.surface_epoch.wrapping_add(1);
         if !is_sync_subsurface(surface) {
             let mut root = surface.clone();
             while let Some(parent) = get_parent(&root) {

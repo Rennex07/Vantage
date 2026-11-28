@@ -13,6 +13,11 @@ pub struct FrameMetrics {
     pending: Option<Instant>,
     frame_budget: Option<Duration>,
     over_budget: usize,
+    animation: bool,
+    previous_sequence: Option<u32>,
+    sequence_samples: usize,
+    extra_intervals: u64,
+    cancelled: usize,
 }
 
 impl FrameMetrics {
@@ -35,6 +40,11 @@ impl FrameMetrics {
                 .filter(|&refresh| refresh > 0)
                 .map(|refresh| Duration::from_nanos(1_000_000_000_000 / refresh as u64)),
             over_budget: 0,
+            animation: false,
+            previous_sequence: None,
+            sequence_samples: 0,
+            extra_intervals: 0,
+            cancelled: 0,
         }
     }
 
@@ -69,9 +79,29 @@ impl FrameMetrics {
         }
     }
 
-    pub fn presented(&mut self) {
+    // Reset the comparison across idle periods, VT switches and non-animation
+    // draws: a gap in page flips is normal when nothing needs repainting.
+    pub fn animation_frame(&mut self, active: bool) {
+        if !active {
+            self.previous_sequence = None;
+        }
+        self.animation = active;
+    }
+
+    pub fn presented(&mut self, sequence: Option<u32>) {
         if let Some(submitted) = self.pending.take() {
             self.presentation.push(submitted.elapsed());
+            if self.animation {
+                if let (Some(previous), Some(current)) = (self.previous_sequence, sequence)
+                    && let Some(extra) = extra_intervals(previous, current)
+                {
+                    self.sequence_samples += 1;
+                    self.extra_intervals += u64::from(extra);
+                }
+                self.previous_sequence = sequence;
+            } else {
+                self.previous_sequence = None;
+            }
             if self.drawing.len() == BATCH_SIZE {
                 self.report();
             }
@@ -79,7 +109,10 @@ impl FrameMetrics {
     }
 
     pub fn cancel_pending(&mut self) {
-        self.pending = None;
+        if self.pending.take().is_some() {
+            self.cancelled += 1;
+        }
+        self.previous_sequence = None;
         if self.drawing.len() == BATCH_SIZE {
             self.report();
         }
@@ -109,6 +142,15 @@ impl FrameMetrics {
                 self.over_budget,
             );
         }
+        if self.backend == "native DRM" {
+            eprintln!(
+                "  Continuous animation DRM sequence samples: {}; extra refresh intervals: {}; cancelled submissions: {}",
+                self.sequence_samples, self.extra_intervals, self.cancelled
+            );
+        }
+        self.sequence_samples = 0;
+        self.extra_intervals = 0;
+        self.cancelled = 0;
         self.over_budget = 0;
         self.binding.clear();
         self.drawing.clear();
@@ -121,6 +163,12 @@ impl Drop for FrameMetrics {
     fn drop(&mut self) {
         self.report();
     }
+}
+
+fn extra_intervals(previous: u32, current: u32) -> Option<u32> {
+    let delta = current.wrapping_sub(previous);
+    // Duplicate or discontinuous counters are not reliable pacing samples.
+    (1..=1000).contains(&delta).then(|| delta - 1)
 }
 
 fn percentile(sorted: &[Duration], percent: usize) -> Duration {
@@ -142,6 +190,15 @@ fn print_stats(label: &str, samples: &mut [Duration]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sequence_gaps_count_only_valid_forward_intervals() {
+        assert_eq!(extra_intervals(8, 9), Some(0));
+        assert_eq!(extra_intervals(8, 11), Some(2));
+        assert_eq!(extra_intervals(u32::MAX, 0), Some(0));
+        assert_eq!(extra_intervals(8, 8), None);
+        assert_eq!(extra_intervals(9, 8), None);
+    }
 
     #[test]
     fn nearest_rank_percentiles_include_tail() {

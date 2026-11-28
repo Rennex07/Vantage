@@ -123,10 +123,17 @@ Set `VANTAGE_GRAPHICS=full` to compare with the configured effects, or
 Set `VANTAGE_FRAME_METRICS=1` to report median, P95 and P99 CPU times for
 buffer binding, scene drawing, and submission. Native mode also reports DRM
 submit-to-callback latency and how many frames took more CPU time than one mode
-interval. Reports group 300 frames, with a final partial group on normal
-shutdown. Use the same mode and interaction sequence for each profile when
-comparing the results. Hardware presentation and missed refresh intervals
-require separate measurements.
+interval. Native DRM sequence gaps are reported for continuous animations,
+excluding idle periods and cancelled submissions. The blur diagnostics count
+cache hits, recomputations and Gaussian/downsample passes. Reports group 300
+samples, with a final partial group on normal shutdown. Use the same mode and
+interaction sequence when comparing profiles. These are CPU and DRM sequence
+measurements, not GPU execution timings or hardware presentation timestamps.
+
+Full effects use detailed frost and reflections; Balanced reduces blur
+resolution and simplifies reflections and grain; Reduced uses solid surfaces.
+The blur cache conservatively reuses a complete unchanged single-panel
+backdrop and invalidates on client commits, visual changes and lock transitions.
 
 The dock raises or restores matching windows across workspaces and shows which
 apps are running. Use **Applications** to pin and unpin apps. In the native

@@ -141,7 +141,7 @@ pub fn run() -> Result<()> {
         x11,
         error: None,
     };
-    handle.insert_source(drm_events, |event, _, native| match event {
+    handle.insert_source(drm_events, |event, metadata, native| match event {
         DrmEvent::VBlank(crtc) if crtc == native.kms.scanout.crtc() && native.pending_flip => {
             native.pending_flip = false;
             match native.kms.scanout.frame_submitted() {
@@ -149,7 +149,9 @@ pub fn run() -> Result<()> {
                     native
                         .state
                         .frame_presented(Instant::now(), native.pending_lock_frame);
-                    native.metrics.presented();
+                    native
+                        .metrics
+                        .presented(metadata.as_ref().map(|m| m.sequence as u32));
                 }
                 Ok(None) => native.metrics.cancel_pending(),
                 Err(error) => native.error = Some(error.into()),
@@ -216,9 +218,13 @@ pub fn run() -> Result<()> {
             .state
             .import_pending_dmabufs(&mut native.kms.renderer);
         server.flush()?;
-        if native.session.is_active()
-            && !native.pending_flip
-            && (native.state.redraw || native.kms.scene.is_animating(&native.state))
+        let animating = native.kms.scene.is_animating(&native.state);
+        if !native.pending_flip {
+            native
+                .metrics
+                .animation_frame(animating && native.session.is_active());
+        }
+        if native.session.is_active() && !native.pending_flip && (native.state.redraw || animating)
         {
             native.state.redraw = false;
             native.pending_lock_frame = native.state.lock_active();

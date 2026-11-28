@@ -92,6 +92,13 @@ pub(super) fn page() -> gtk::Box {
     });
     content.append(&label("Effects"));
     content.append(&effects);
+    let description = gtk::Label::new(Some(
+        "Full: detailed frost. Balanced: lower-resolution blur and simpler reflections. Reduced: solid surfaces.",
+    ));
+    description.set_wrap(true);
+    description.set_xalign(0.0);
+    description.add_css_class("dim-label");
+    content.append(&description);
     content
 }
 

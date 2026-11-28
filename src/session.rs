@@ -280,6 +280,9 @@ impl Scene {
             None
         };
         if state.lock_active() {
+            if let Some(glass) = &mut self.glass {
+                glass.invalidate_backdrop();
+            }
             self.panel_motion = PanelMotion::default();
             self.notification_panel = None;
             self.notification_banner = None;
@@ -506,6 +509,9 @@ impl Scene {
                 GlassStyle {
                     overview: overview as f32,
                     full_effects: state.appearance.effects == Effects::Full,
+                    theme,
+                    wallpaper_moving: self.wallpaper.animating(now),
+                    surface_epoch: state.surface_epoch,
                 },
             ) {
                 Ok(texture) => Some(texture),
@@ -517,6 +523,9 @@ impl Scene {
                 }
             }
         } else {
+            if let Some(glass) = &mut self.glass {
+                glass.invalidate_backdrop();
+            }
             None
         };
         status_view.solid |= self.glass_failed;

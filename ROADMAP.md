@@ -34,7 +34,7 @@ This is the current local working tree. The repository's published history and t
 | --- | --- | --- |
 | Login and boot | LightDM session entry, libseat-backed native mode, Winit preview, opt-in Plymouth theme | Repeatable install, greeter polish, session service lifecycle and recovery. See [session/vantage.desktop](session/vantage.desktop) and [src/native.rs](src/native.rs). |
 | Shell | Pi 4 wordmark, three workspaces, time and status, app pinning and running indicators, notification banners and an in-memory center | Multi-window dock actions, identity edge cases, notification grouping and per-app policy, accessible overlays and gestural navigation. See [src/shell](src/shell). |
-| Motion and effects | Shared transition primitives, app opening and workspace animation, live overview, Gaussian frost and refraction, safe graphics fallback and CPU frame timing | Finish the animation catalog and geometry-based input, add damage-aware blur reuse, quality tiers and presentation measurements. See [src/shell/motion.rs](src/shell/motion.rs) and [src/shell/glass.rs](src/shell/glass.rs). |
+| Motion and effects | Shared transition primitives, app opening and workspace animation, live overview, Gaussian frost and refraction, safe graphics fallback and CPU frame timing | Finish the animation catalog and geometry-based input, extend single-panel backdrop reuse to regional and multi-panel damage tracking, and validate presentation measurements. See [src/shell/motion.rs](src/shell/motion.rs) and [src/shell/glass.rs](src/shell/glass.rs). |
 | Windows | Focus, move, resize, tile, maximize, minimize and restore, Alt+Tab, overview and native xdg fullscreen | Fullscreen edge-case tests, menus and tooltips, transient and modal behavior, activation, sequences across outputs and dock window selection. See [src/wayland/windows.rs](src/wayland/windows.rs). |
 | Settings | A searchable Settings window with Appearance, Display, Sound, Network, Bluetooth, Lock Screen, Accessibility, and Date & Time. Time zone uses the Debian system service. | A shared live device model, real laptop backlight, live display controls, and search inside individual pages. See [src/desktop/settings.rs](src/desktop/settings.rs). |
 | Lock and power | Compositor-owned password entry and Debian PAM authentication helper, wallpaper or clock-only AOD | Idle and lid policy, display-off, resume, lock on external sleep and multiple displays. See [src/wayland/lock.rs](src/wayland/lock.rs). |
@@ -52,9 +52,21 @@ correctly. Firefox entered and exited fullscreen with its floating geometry
 restored and appeared in the running-app dock. The native notification
 service accepted a D-Bus notification and displayed its banner and history.
 Offline Cargo build and 29 tests passed, with one unused-import warning.
-This is smoke-test evidence, not a complete milestone gate. Frame pacing,
-damage-aware blur caching, animation reversal, notification privacy/action
-edge cases, other applications, and the physical hardware matrix remain open.
+This is smoke-test evidence, not a complete milestone gate. Animation reversal,
+notification privacy/action edge cases, other applications, and the physical
+hardware matrix remain open.
+
+Follow-up rendering batch: a conservative single-panel backdrop cache checks
+layer identity, geometry, opacity, source, transform, commit and wallpaper state.
+Balanced effects reduce blur resolution and simplify reflections and grain.
+Native DRM diagnostics count extra sequence intervals during continuous
+animations and exclude idle gaps. The offline Debian build completed without
+warnings; 30 tests passed. At 1920x1080 with SVGA3D, Files rendered correctly
+and two logged batches of 300 blur samples recorded 299 and 300 cache hits
+respectively (one recomputation, three Gaussian/downsample passes). This is a
+static-backdrop interaction sample, not an FPS or GPU-time benchmark. The
+observed sequence sample count was zero, so missed-refresh performance remains
+unverified. Multi-panel and region-specific damage reuse remain open.
 
 ## Milestone 1 Visual identity and motion
 

@@ -3,14 +3,15 @@ use smithay::{
         allocator::Fourcc,
         renderer::{
             Bind, Frame, Offscreen, Renderer, Texture,
+            element::{Element, Id},
             gles::{
                 GlesError, GlesRenderer, GlesTexProgram, GlesTexture, Uniform, UniformName,
                 UniformType,
             },
-            utils::draw_render_elements,
+            utils::{CommitCounter, draw_render_elements},
         },
     },
-    utils::{Physical, Rectangle, Size, Transform},
+    utils::{Buffer, Physical, Rectangle, Size, Transform},
 };
 
 use crate::{
@@ -33,6 +34,9 @@ pub struct FrostedWindow {
 pub struct GlassStyle {
     pub overview: f32,
     pub full_effects: bool,
+    pub theme: Theme,
+    pub wallpaper_moving: bool,
+    pub surface_epoch: u64,
 }
 
 pub struct Glass {
@@ -40,6 +44,71 @@ pub struct Glass {
     frost: GlesTexProgram,
     textures: Option<Buffers>,
     lock: Option<LockBlur>,
+    backdrop: Option<BackdropKey>,
+    metrics: BlurMetrics,
+}
+
+// Reuse only a single complete backdrop. Include exact layer order, source,
+// geometry, opacity and commit, and conservatively invalidate on every
+// client commit when the backdrop contains client content.
+#[derive(PartialEq)]
+struct BackdropKey {
+    theme: Theme,
+    overview: u32,
+    surface_epoch: u64,
+    elements: Vec<ElementKey>,
+}
+
+#[derive(PartialEq)]
+struct ElementKey {
+    id: Id,
+    commit: CommitCounter,
+    geometry: Rectangle<i32, Physical>,
+    source: Rectangle<f64, Buffer>,
+    transform: Transform,
+    alpha: u32,
+}
+
+#[derive(Default)]
+struct BlurMetrics {
+    enabled: bool,
+    hits: u64,
+    misses: u64,
+    passes: u64,
+}
+
+impl BlurMetrics {
+    fn record(&mut self, hit: bool) {
+        if !self.enabled {
+            return;
+        }
+        if hit {
+            self.hits += 1;
+        } else {
+            self.misses += 1;
+            self.passes += 3;
+        }
+        if self.hits + self.misses >= 300 {
+            self.report();
+        }
+    }
+    fn report(&mut self) {
+        if self.hits + self.misses == 0 {
+            return;
+        }
+        eprintln!(
+            "Backdrop blur: {} cache hits, {} recomputes, {} Gaussian/downsample passes",
+            self.hits, self.misses, self.passes
+        );
+        self.hits = 0;
+        self.misses = 0;
+        self.passes = 0;
+    }
+}
+impl Drop for BlurMetrics {
+    fn drop(&mut self) {
+        self.report();
+    }
 }
 
 struct LockBlur {
@@ -76,11 +145,21 @@ impl Glass {
                     UniformName::new("corner_radius", UniformType::_1f),
                     UniformName::new("surface_color", UniformType::_3f),
                     UniformName::new("daylight", UniformType::_1f),
+                    UniformName::new("full_quality", UniformType::_1f),
                 ],
             )?,
             textures: None,
             lock: None,
+            backdrop: None,
+            metrics: BlurMetrics {
+                enabled: std::env::var_os("VANTAGE_FRAME_METRICS").is_some_and(|v| v == "1"),
+                ..Default::default()
+            },
         })
+    }
+
+    pub fn invalidate_backdrop(&mut self) {
+        self.backdrop = None;
     }
 
     pub fn lock_blur(
@@ -154,6 +233,7 @@ impl Glass {
                 && buffers.scene.size().h == size.h
                 && buffers.downsample == downsample
         }) {
+            self.backdrop = None;
             let full = (size.w, size.h).into();
             let reduced = (
                 (size.w + downsample - 1) / downsample,
@@ -167,6 +247,34 @@ impl Glass {
                 downsample,
             });
         }
+        let key = if !style.wallpaper_moving && windows.glass.len() == 1 {
+            let behind = &windows.elements[windows.glass[0].behind..];
+            Some(BackdropKey {
+                theme: style.theme,
+                overview: style.overview.to_bits(),
+                surface_epoch: if behind.is_empty() {
+                    0
+                } else {
+                    style.surface_epoch
+                },
+                elements: behind
+                    .iter()
+                    .map(|element| ElementKey {
+                        id: element.id().clone(),
+                        commit: element.current_commit(),
+                        geometry: element.geometry(1.0.into()),
+                        source: element.src(),
+                        transform: element.transform(),
+                        alpha: element.alpha().to_bits(),
+                    })
+                    .collect(),
+            })
+        } else {
+            None
+        };
+        let cached = key.is_some() && self.backdrop == key;
+        // Publish a key only after a complete successful composition.
+        self.backdrop = None;
         let buffers = self.textures.as_mut().expect("glass textures allocated");
         let bounds = Rectangle::from_size(size);
         let mut scene = renderer.bind(&mut buffers.scene)?;
@@ -198,27 +306,30 @@ impl Glass {
             // The framebuffer binding retains a reference to the scene texture.
             drop(scene);
             let low_size = buffers.horizontal.size();
-            blur_pass(
-                renderer,
-                &self.gaussian,
-                &buffers.scene,
-                &mut buffers.blurred,
-                (0.0, 0.0),
-            )?;
-            blur_pass(
-                renderer,
-                &self.gaussian,
-                &buffers.blurred,
-                &mut buffers.horizontal,
-                (1.0 / low_size.w as f32, 0.0),
-            )?;
-            blur_pass(
-                renderer,
-                &self.gaussian,
-                &buffers.horizontal,
-                &mut buffers.blurred,
-                (0.0, 1.0 / low_size.h as f32),
-            )?;
+            self.metrics.record(cached);
+            if !cached {
+                blur_pass(
+                    renderer,
+                    &self.gaussian,
+                    &buffers.scene,
+                    &mut buffers.blurred,
+                    (0.0, 0.0),
+                )?;
+                blur_pass(
+                    renderer,
+                    &self.gaussian,
+                    &buffers.blurred,
+                    &mut buffers.horizontal,
+                    (1.0 / low_size.w as f32, 0.0),
+                )?;
+                blur_pass(
+                    renderer,
+                    &self.gaussian,
+                    &buffers.horizontal,
+                    &mut buffers.blurred,
+                    (0.0, 1.0 / low_size.h as f32),
+                )?;
+            }
             scene = renderer.bind(&mut buffers.scene)?;
             let mut frame = renderer.render(&mut scene, size, SURFACE_TRANSFORM)?;
             let x = f64::from(panel.bounds.loc.x) / f64::from(size.w);
@@ -248,6 +359,7 @@ impl Glass {
                     Uniform::new("corner_radius", panel.radius),
                     Uniform::new("surface_color", (r as f32, g as f32, b as f32)),
                     Uniform::new("daylight", daylight),
+                    Uniform::new("full_quality", f32::from(style.full_effects)),
                     Uniform::new(
                         "panel_size",
                         (panel.bounds.size.w as f32, panel.bounds.size.h as f32),
@@ -262,6 +374,8 @@ impl Glass {
             let _ = frame.finish()?;
         }
         drop(scene);
+        // An entirely clipped panel never filled the blur texture.
+        self.backdrop = key.filter(|_| windows.glass[0].bounds.intersection(bounds).is_some());
         Ok(&buffers.scene)
     }
 }
